@@ -19,13 +19,14 @@ sentinel-ai/
 │   ├── index_bm25.py
 │   ├── index_qdrant.py
 │   ├── validate_documents.py    # schema + extraction-coverage checks
-│   └── evaluate_retrieval.py    # BM25 vs vector vs RRF vs RRF+rerank, Hit@K/Recall@K/MRR
+│   └── evaluate_retrieval.py    # BM25 vs vector vs RRF vs RRF+rerank vs RRF+rerank+boost
 └── app/                         # online, long-lived query path
     ├── retrieval/
     │   ├── bm25_retriever.py
     │   ├── vector_retriever.py
     │   ├── fusion.py
     │   ├── reranker.py
+    │   ├── exact_match.py       # ExactMatchBooster: pin known-item ID matches to rank 1
     │   └── hybrid.py
     └── agent/
         ├── router.py            # IntentRouter: classify(query) -> intent/category/confidence
@@ -148,12 +149,14 @@ flowchart TB
         bm25r -->|"top 50, ranked"| rrf["reciprocal_rank_fusion()\nscore = Σ 1/(k + rank)"]
         vecr -->|"top 50, ranked"| rrf
         rrf -->|"top 20 candidates"| rerank["CrossEncoderReranker.rerank()\nms-marco-MiniLM-L-6-v2"]
-        rerank --> results(["final top-N results\ndocument_id, title, rrf_score,\nranks, reranker_score, final_rank"])
+        rerank -->|"wide candidate list"| boost["ExactMatchBooster.boost()\npin detected exact-ID match to #1"]
+        boost --> results(["final top-N results\ndocument_id, title, rrf_score,\nranks, reranker_score, final_rank,\nexact_match if boosted"])
     end
 
     tool --> query
     results --> tool
     docs -.->|"content lookup for reranking"| rerank
+    docs -.->|"id -> document lookup"| boost
 ```
 
 ### Offline: ingestion + indexing (`scripts/`)
@@ -163,7 +166,7 @@ flowchart TB
 3. **`validate_documents.py`** checks every document has the six required top-level fields, `document_id` is unique, `source` is an object with a name, and that extraction actually worked: ≥95% of `attack_technique` docs must carry a non-empty `tactics` list, ≥50% of `detection_rule` docs must carry a non-empty `attack_techniques` list. Exits non-zero on failure — see [DECISIONS.md](DECISIONS.md) for why those specific floors and the measured coverage (100% / 89%).
 4. **`index_bm25.py`** tokenizes `native_id×10 + title + content + metadata.raw` per document (the source-specific ID — `technique_id` or `rule_id` — is repeated to weight exact-ID queries heavily) and builds a `BM25Okapi` index, pickled alongside a lightweight metadata sidecar (`bm25_meta.json`, keyed by `document_id`) so query results don't require re-loading the full corpus. Tokenization strips a small English stopword list (`app/retrieval/bm25_retriever.py:tokenize`, imported here rather than duplicated) — classic Okapi BM25's IDF term goes negative for words in more than half the corpus, so without this a natural-language query like `"What is T1059?"` gets actively penalized by "is"/"what" appearing in most documents. See [DECISIONS.md](DECISIONS.md).
 5. **`index_qdrant.py`** embeds `"{native_id}. {title}. {content}"` per document with `sentence-transformers/all-MiniLM-L6-v2` (384-dim, cosine distance), batches upserts of 100 into a local embedded Qdrant collection at `data/qdrant_db/`, payload keyed by `document_id`.
-6. **`evaluate_retrieval.py`** runs a fixed 10-query set through BM25-only, vector-only, RRF, and RRF+rerank, scoring each against title-substring-derived relevance sets. See [DECISIONS.md](DECISIONS.md) for the full results table and methodology.
+6. **`evaluate_retrieval.py`** runs a fixed 11-query set through BM25-only, vector-only, RRF, RRF+rerank, and RRF+rerank+boost, scoring each against title-substring- or metadata-derived relevance sets. See [DECISIONS.md](DECISIONS.md) for the full results table and methodology.
 
 Current corpus: **3,995 documents** (3,137 Sigma rules + 858 ATT&CK techniques).
 
@@ -173,24 +176,26 @@ Current corpus: **3,995 documents** (3,137 Sigma rules + 858 ATT&CK techniques).
 2. **`VectorRetriever`** (`vector_retriever.py`) loads the embedding model + opens the Qdrant client once at construction, then on `.search(query, limit)` embeds the query and returns the top-`limit` docs by cosine similarity.
 3. **`reciprocal_rank_fusion`** (`fusion.py`) takes any number of named ranked lists (keyed `"bm25"`, `"vector"`) and fuses them by rank position — not raw score — into one ranking, tagging each result with a `ranks` dict showing which retriever(s) found it and at what rank. See [DECISIONS.md](DECISIONS.md) for why RRF and not a weighted blend.
 4. **`CrossEncoderReranker`** (`reranker.py`) loads `documents.json` once to build a `document_id -> content` lookup, then re-scores a candidate list against the full query+document text with a cross-encoder, returning results re-sorted with `initial_rank`/`reranker_score`/`final_rank` attached.
-5. **`HybridSearcher`** (`hybrid.py`) is the retrieval entry point: constructs both retrievers once, and on `.search(query, limit)` pulls the top 50 candidates from each and fuses them down to the requested `limit` via RRF (`k=60`). It does not call the reranker itself — reranking is composed on top explicitly (in `reranker.py`'s `main()` and in the eval script) so BM25/vector/RRF/RRF+rerank stay independently runnable and comparable, per PLAN §11.
+5. **`ExactMatchBooster`** (`exact_match.py`) loads `documents.json` once to build `{technique_id: doc}`/`{rule_id: doc}` lookups, detects known-item identifiers in the query via regex (ATT&CK technique IDs, Sigma rule UUIDs), and pins any exact match to the front of a candidate list — a document rank-based fusion found at rank #1 in only one retriever can otherwise be out-ranked by a document found moderately by both (see [DECISIONS.md](DECISIONS.md) for the measured case where this mattered: RRF+rerank alone scored 0.00 on every metric for a natural-language exact-ID question).
+6. **`HybridSearcher`** (`hybrid.py`) is the retrieval entry point: constructs both retrievers once, and on `.search(query, limit)` pulls the top 50 candidates from each and fuses them down to the requested `limit` via RRF (`k=60`). It does not call the reranker or booster itself — both are composed on top explicitly (in their own `main()`s, in the eval script, and in the tool layer) so BM25/vector/RRF/RRF+rerank/RRF+rerank+boost all stay independently runnable and comparable, per PLAN §11.
 
 Run any stage directly:
 ```
 python -m app.retrieval.hybrid
 python -m app.retrieval.reranker
+python -m app.retrieval.exact_match
 python scripts/evaluate_retrieval.py
 python scripts/validate_documents.py
 ```
 
-Both retrievers, the reranker, and the fused searcher are safe to hold as long-lived instances (e.g. one of each per process) — this is intentional so a future API layer doesn't reload models/indices per request.
+Both retrievers, the reranker, the booster, and the fused searcher are safe to hold as long-lived instances (e.g. one of each per process) — this is intentional so a future API layer doesn't reload models/indices per request.
 
 ### Online: intent routing + tool layer (`app/agent/`)
 
 This is the "Read vs Write" branch from PLAN §3's architecture diagram — it decides what a natural-language query is asking for and routes it, without yet being able to actually execute a write.
 
 1. **`IntentRouter`** (`router.py`) classifies a query against a small fixed set of intents (`explain_technique`, `search_detection_rule`, `search_knowledge_base` — read; `block_ip`, `isolate_endpoint` — write), each defined by a handful of example utterances plus optional keyword/regex signals. Scoring combines a semantic signal (max cosine similarity against an intent's example-utterance embeddings, same `all-MiniLM-L6-v2` model retrieval already uses) with a lexical signal (keyword/technique-ID-pattern match), then gates the decision on both an absolute confidence threshold (stricter for write intents) and a minimum margin over the runner-up intent. Below either bar, it returns `clarify` instead of guessing. See [DECISIONS.md](DECISIONS.md) for the full rationale and the specific edge cases this was verified against.
-2. **`ToolRegistry`** (`tools.py`) holds 8 tools matching PLAN §13's initial list, each a `Tool` dataclass declaring `name`, `description`, `category`, `side_effecting`, `idempotent`, `required_permission`, `audit_event`, a pydantic `input_model`, and a `handler`. Two are real (`search_knowledge_base`, `search_sigma_rules` — both call the full RRF+rerank pipeline with an optional/fixed `doc_type` filter); three are honest stubs returning "no data source yet" (`lookup_ioc`, `get_alert`, `get_incident` — blocked on Phase 1/8); three are honest stubs returning `{"status": "not_executed", ...}` (`create_incident`, `block_ip`, `isolate_endpoint` — blocked on Phase 7's RBAC/confirm/execute pipeline).
+2. **`ToolRegistry`** (`tools.py`) holds 8 tools matching PLAN §13's initial list, each a `Tool` dataclass declaring `name`, `description`, `category`, `side_effecting`, `idempotent`, `required_permission`, `audit_event`, a pydantic `input_model`, and a `handler`. Two are real (`search_knowledge_base`, `search_sigma_rules` — both call the full RRF+rerank+boost pipeline with an optional/fixed `doc_type` filter); three are honest stubs returning "no data source yet" (`lookup_ioc`, `get_alert`, `get_incident` — blocked on Phase 1/8); three are honest stubs returning `{"status": "not_executed", ...}` (`create_incident`, `block_ip`, `isolate_endpoint` — blocked on Phase 7's RBAC/confirm/execute pipeline).
 3. **`Orchestrator`** (`orchestrator.py`) is the thin glue: classify, then for a confident read intent call the matching tool (an intent and a tool are not the same thing — `explain_technique` and `search_knowledge_base` both end up calling the `search_knowledge_base` tool, just with a different `doc_type`); for a confident write intent, report the classification and stop, since there's nowhere further to hand it off to yet; for `clarify`, return the router's message as-is.
 
 Run it directly:

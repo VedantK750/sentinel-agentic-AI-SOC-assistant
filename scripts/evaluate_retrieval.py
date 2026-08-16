@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.retrieval.bm25_retriever import BM25Retriever  # noqa: E402
+from app.retrieval.exact_match import ExactMatchBooster  # noqa: E402
 from app.retrieval.fusion import reciprocal_rank_fusion  # noqa: E402
 from app.retrieval.reranker import CrossEncoderReranker  # noqa: E402
 from app.retrieval.vector_retriever import VectorRetriever  # noqa: E402
@@ -15,7 +16,7 @@ DOCS_PATH = ROOT / "data" / "documents.json"
 K = 10
 RRF_CANDIDATE_LIMIT = 50
 RERANK_CANDIDATE_LIMIT = 20
-METHODS = ["bm25", "vector", "rrf", "rrf+rerank"]
+METHODS = ["bm25", "vector", "rrf", "rrf+rerank", "rrf+rerank+boost"]
 
 # A document is judged relevant to a query if its title matches the rule below
 # (all `terms` present, and if given, at least one of `any_terms` present) --
@@ -23,6 +24,11 @@ METHODS = ["bm25", "vector", "rrf", "rrf+rerank"]
 # the absence of hand-labeled relevance judgments. See DECISIONS.md.
 EVAL_QUERIES = [
     {"query": "T1059", "technique_id_equals": "T1059"},
+    # Deliberately the natural-language phrasing of an exact-ID lookup, not the bare
+    # ID -- this is the query shape that exposed both the BM25 stopword bug and the
+    # RRF-can't-see-confidence limitation that ExactMatchBooster now compensates
+    # for. See DECISIONS.md.
+    {"query": "What is T1003.001?", "technique_id_equals": "T1003.001"},
     {"query": "credential dumping", "terms": ["credential dump"]},
     {"query": "powershell execution", "terms": ["powershell", "execution"]},
     {"query": "curl file upload", "terms": ["curl", "upload"]},
@@ -88,6 +94,7 @@ def main():
     bm25 = BM25Retriever()
     vector = VectorRetriever()
     reranker = CrossEncoderReranker()
+    booster = ExactMatchBooster()
 
     totals = {m: {"hit": 0.0, "recall": [], "mrr": 0.0} for m in METHODS}
 
@@ -105,13 +112,15 @@ def main():
         rrf_results = reciprocal_rank_fusion(
             {"bm25": bm25_results, "vector": vector_results}, limit=RERANK_CANDIDATE_LIMIT
         )
-        reranked = reranker.rerank(query, rrf_results, limit=K)
+        reranked_wide = reranker.rerank(query, rrf_results, limit=RERANK_CANDIDATE_LIMIT)
+        boosted = booster.boost(query, reranked_wide, limit=K)
 
         runs = {
             "bm25": [d["document_id"] for d in bm25_results],
             "vector": [d["document_id"] for d in vector_results],
             "rrf": [d["document_id"] for d in rrf_results],
-            "rrf+rerank": [d["document_id"] for d in reranked],
+            "rrf+rerank": [d["document_id"] for d in reranked_wide[:K]],
+            "rrf+rerank+boost": [d["document_id"] for d in boosted],
         }
 
         for method in METHODS:

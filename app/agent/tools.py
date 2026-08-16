@@ -3,6 +3,7 @@ from typing import Callable, Optional, Type
 
 from pydantic import BaseModel
 
+from app.retrieval.exact_match import ExactMatchBooster
 from app.retrieval.hybrid import HybridSearcher
 from app.retrieval.reranker import CrossEncoderReranker
 
@@ -96,6 +97,7 @@ class ToolRegistry:
 
 _searcher = None
 _reranker = None
+_booster = None
 
 
 def _get_searcher():
@@ -112,14 +114,26 @@ def _get_reranker():
     return _reranker
 
 
+def _get_booster():
+    global _booster
+    if _booster is None:
+        _booster = ExactMatchBooster()
+    return _booster
+
+
 def _search(query, limit, doc_type=None):
-    """RRF hybrid search, then cross-encoder rerank -- the full validated pipeline
-    from Phase 4 (RRF+rerank was the best-measured combination), not just RRF alone.
+    """RRF hybrid search, then cross-encoder rerank, then exact-match boosting --
+    the full pipeline. RRF+rerank was the best-measured combination in Phase 4;
+    boosting on top handles known-item queries (exact technique/rule IDs) that
+    rank-based fusion can under-rank even when one retriever found them at #1 --
+    see DECISIONS.md.
     """
     searcher = _get_searcher()
     reranker = _get_reranker()
+    booster = _get_booster()
     candidates = searcher.search(query, limit=RERANK_CANDIDATE_LIMIT, doc_type=doc_type)
-    return reranker.rerank(query, candidates, limit=limit)
+    reranked = reranker.rerank(query, candidates, limit=RERANK_CANDIDATE_LIMIT)
+    return booster.boost(query, reranked, limit=limit)
 
 
 # --- read tool handlers (real, backed by retrieval) --------------------------

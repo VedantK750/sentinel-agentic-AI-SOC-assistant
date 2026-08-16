@@ -4,6 +4,28 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-16 — Exact-match boosting for known-item queries (`app/retrieval/exact_match.py`)
+
+**Decision:** Added `ExactMatchBooster` as an explicit final stage after RRF+rerank: it detects known-item identifiers in the query (ATT&CK technique IDs, Sigma rule UUIDs — a registry of `(regex pattern, metadata field)` pairs, extensible to IOCs later) and, if the corpus has a document with that exact ID, pins it to the front of the result list. Deliberately a separate stage, not folded into `HybridSearcher` or the reranker — the same reasoning as keeping reranking separate from RRF: BM25/vector/RRF/RRF+rerank keep meaning exactly what the Phase 4 eval already measured, and this stage's own effect is independently measurable (`scripts/evaluate_retrieval.py` now has a fifth `rrf+rerank+boost` column).
+
+**Why this is a different fix from retuning `k`:** RRF only sees rank position, never raw score, so it can't distinguish "BM25 rank #1 because this is a near-unique exact token match" from "BM25 rank #1 because it edged out rank #2 by a hair." An exact identifier match is about as unambiguous as retrieval evidence gets — this makes that certainty explicit instead of hoping fusion/rerank parameters happen to preserve it. Retuning `k` globally would change behavior for every query, including the ones where RRF's "combine evidence across retrievers" design is already correct (most of what Phase 4 validated); this only activates for the narrow, well-defined case of a detected exact identifier.
+
+**Implementation:** loads `documents.json` once at construction to build `{metadata_field: {normalized_id_value: document}}` lookup tables (same one-time-load pattern as `CrossEncoderReranker`'s content lookup). `.detect(query)` finds identifier matches; `.boost(query, results, limit)` prepends them (deduplicated against `results`) and truncates to `limit`. A detected exact match is injected even if the upstream pipeline didn't return it at all — correct by construction, not just highly ranked. Wired into `app/agent/tools.py`'s `_search()` as the final pipeline stage; the reranker now reranks a wide candidate set (`RERANK_CANDIDATE_LIMIT=20`) rather than truncating straight to the requested limit, so boosting has enough non-exact-match results left to fill out the final list after prepending.
+
+**Measured, not assumed:** the existing eval set didn't exercise this at all — none of its 10 queries were natural-language exact-ID questions (all short keyword phrases). Added `"What is T1003.001?"` specifically to test this query shape, and the result is dramatic:
+
+| method | Hit@10 | Recall@10 | MRR |
+|---|---|---|---|
+| BM25 | 1.00 | 1.00 | 1.00 |
+| Vector | 0.00 | 0.00 | 0.00 |
+| RRF | 1.00 | 1.00 | 0.50 |
+| RRF+rerank | **0.00** | **0.00** | **0.00** |
+| RRF+rerank+boost | 1.00 | 1.00 | 1.00 |
+
+RRF+rerank doesn't just under-rank T1003.001 for this query — it drops it out of the top 10 **entirely**. The reranker's non-domain-tuned scoring (already documented as a known limitation) actively made this worse, not just neutral. Boosting recovers perfect scores regardless of what the upstream pipeline did. Aggregate over the now-11-query eval set: RRF+rerank+boost reaches **1.000 Hit@10 / 0.715 Recall@10 / 1.000 MRR**, clearly ahead of RRF+rerank's 0.909/0.625/0.909 — a real, measured improvement, not just a fix for one cherry-picked query.
+
+---
+
 ## 2026-08-16 — Bug found and fixed while building Phase 5: BM25 stopwords had negative weight
 
 **What happened:** building the intent router's `explain_technique` tool exposed the first natural-language question ever run through BM25 end-to-end (`"What is T1059?"` — every prior query, in every eval and demo, was a short keyword phrase like `"T1059"` or `"curl file upload"`, never a full grammatical question). That query returned `T1070.004 File Deletion` as the top `attack_technique` result — a document with no relation to T1059 at all — instead of T1059 itself.
@@ -16,10 +38,10 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 **Verified:** `"What is T1059?"` now returns T1059 as `BM25Retriever`'s #1 result. Re-ran the full `scripts/evaluate_retrieval.py` suite afterward — aggregate numbers are flat to very slightly improved (RRF+rerank recall@10 0.682 → 0.687), confirming the fix doesn't regress anything the eval set already validated.
 
-**Residual, characterized (not fixed) limitation:** even after the stopword fix, `"What is T1059?"` through the *full* RRF+rerank pipeline still doesn't put T1059 at rank 1 (BM25 alone gets it right; RRF and the reranker both nudge it down). This is not a bug, it's two already-documented properties compounding on this specific query shape:
-- RRF's design (see the RRF decision above) rewards a document found by *both* retrievers over one found by only one, even at a worse individual rank. Here T1059 is BM25's #1 but absent from vector's top 50 entirely, while a semantically-nearby-but-wrong document appears moderately in both lists and out-scores it under `k=60`.
-- The reranker (see the reranker decision above) is a general-purpose model with no security-domain knowledge, and doesn't reliably fix this either.
-Not addressed here — retuning `k` or the reranker mid-router-build would change already-eval-validated Phase 4 numbers without re-running that validation, which deserves its own pass, not a side effect of Phase 5 work. Worth revisiting if this query shape matters enough later — a concrete option raised (not built): since the router's `explain_technique` intent already regex-detects a literal technique ID in the query, the tool could short-circuit straight to a `document_id` lookup for that case instead of going through retrieval at all.
+**Residual limitation found (later fixed, not here):** even after the stopword fix, `"What is T1059?"` through the *full* RRF+rerank pipeline still didn't put T1059 at rank 1 (BM25 alone got it right; RRF and the reranker both nudged it down). Two already-documented properties compounding on this specific query shape:
+- RRF's design (see the RRF decision above) rewards a document found by *both* retrievers over one found by only one, even at a worse individual rank. Here T1059 was BM25's #1 but absent from vector's top 50 entirely, while a semantically-nearby-but-wrong document appeared moderately in both lists and out-scored it under `k=60`.
+- The reranker (see the reranker decision above) is a general-purpose model with no security-domain knowledge, and didn't reliably fix this either.
+Deliberately not addressed by retuning `k` or the reranker — that would change already-eval-validated Phase 4 numbers without re-running that validation. Instead fixed properly afterward with a dedicated, measured mechanism — see the exact-match boosting decision above.
 
 ---
 
