@@ -4,6 +4,57 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-16 — Bug found and fixed while building Phase 5: BM25 stopwords had negative weight
+
+**What happened:** building the intent router's `explain_technique` tool exposed the first natural-language question ever run through BM25 end-to-end (`"What is T1059?"` — every prior query, in every eval and demo, was a short keyword phrase like `"T1059"` or `"curl file upload"`, never a full grammatical question). That query returned `T1070.004 File Deletion` as the top `attack_technique` result — a document with no relation to T1059 at all — instead of T1059 itself.
+
+**Root cause:** classic Okapi BM25's IDF term is `log((N - n(t) + 0.5) / (n(t) + 0.5))`, which goes **negative** once a term appears in more than half the corpus. Words like "is" and "what" appear in nearly every one of the 858 ATT&CK technique descriptions, so for the query `"what is t1059"`, those two terms didn't just contribute nothing — they actively subtracted score from any document that happened to use them a lot, which most fluently-written technique descriptions do. The single correctly-matching term ("t1059") wasn't enough to overcome the penalty from the other two.
+
+**Why this stayed hidden through Phase 2-4:** every query used anywhere in this project up to this point (the eval set, every retrieval demo, every reranker smoke test) was a short keyword-style phrase with no stopwords. Phase 5 is the first place a full sentence hit `BM25Retriever` — this was a latent defect in `tokenize()` since Phase 2, only surfaced by the first natural-language caller.
+
+**Fix:** added a small hardcoded English stopword list (~80 words) and filter it out at tokenization. Also collapsed `tokenize()` from two copies (`scripts/index_bm25.py` had its own duplicate of `app/retrieval/bm25_retriever.py`'s function) into one — `index_bm25.py` now imports it — because the bug case is exactly why two copies is dangerous: index-time and query-time tokenization must always match exactly, or the index and the query silently speak different languages. Documented in the function itself, not just here, since anyone editing it needs the warning at the point of edit.
+
+**Verified:** `"What is T1059?"` now returns T1059 as `BM25Retriever`'s #1 result. Re-ran the full `scripts/evaluate_retrieval.py` suite afterward — aggregate numbers are flat to very slightly improved (RRF+rerank recall@10 0.682 → 0.687), confirming the fix doesn't regress anything the eval set already validated.
+
+**Residual, characterized (not fixed) limitation:** even after the stopword fix, `"What is T1059?"` through the *full* RRF+rerank pipeline still doesn't put T1059 at rank 1 (BM25 alone gets it right; RRF and the reranker both nudge it down). This is not a bug, it's two already-documented properties compounding on this specific query shape:
+- RRF's design (see the RRF decision above) rewards a document found by *both* retrievers over one found by only one, even at a worse individual rank. Here T1059 is BM25's #1 but absent from vector's top 50 entirely, while a semantically-nearby-but-wrong document appears moderately in both lists and out-scores it under `k=60`.
+- The reranker (see the reranker decision above) is a general-purpose model with no security-domain knowledge, and doesn't reliably fix this either.
+Not addressed here — retuning `k` or the reranker mid-router-build would change already-eval-validated Phase 4 numbers without re-running that validation, which deserves its own pass, not a side effect of Phase 5 work. Worth revisiting if this query shape matters enough later — a concrete option raised (not built): since the router's `explain_technique` intent already regex-detects a literal technique ID in the query, the tool could short-circuit straight to a `document_id` lookup for that case instead of going through retrieval at all.
+
+---
+
+## 2026-08-16 — Phase 5: intent router (`app/agent/router.py`) reuses the hybrid-retrieval pattern
+
+**Decision:** Classify a query into one of a small set of intents using the same lexical+semantic combination retrieval already uses — a keyword/regex signal, a sentence-embedding similarity signal against per-intent example utterances, combined and gated by a confidence threshold — rather than training a classifier or hand-writing a rule engine.
+
+**Why:** PLAN §12 specifies exactly this cascade (`lexical/IDF → semantic → hybrid fusion → confidence threshold → escalate/clarify`), and it's the same underlying problem retrieval already solves: matching a query against a small reference set, where exact phrasing and paraphrase both need to work. No labeled intent-classification training data exists, so a trained classifier isn't an option yet; a pure keyword rule engine would miss paraphrases the way BM25-alone misses them in retrieval.
+
+**Confidence gating, asymmetric by category:** the top intent must clear a threshold (`0.35` read / `0.55` write — write requires more confidence) **and** beat the runner-up by a minimum margin (`0.05`), or the router returns `clarify` instead of guessing. Both thresholds needed because either failure mode alone is misleading: a single high score can still be a coin-flip against a near-tied runner-up (e.g. `"What sigma rule covers T1003"` scores 0.79 for `search_detection_rule` — well above threshold — but only edges `explain_technique` by 0.04, below the margin requirement, so it correctly clarifies rather than guessing between two legitimately valid interpretations). The write/read asymmetry is a direct application of PLAN §18's fail-closed principle: misrouting into a read search costs a wasted query, misrouting into a write intent risks proposing the wrong action.
+
+**Verified, including an honest asymmetry left as-is:** `"block"` alone scores 0.54 — just under the 0.55 write threshold — and correctly clarifies instead of committing to `block_ip` with no target specified. `"isolate"` alone, by contrast, scores 0.74 and *does* commit to `isolate_endpoint`, because "isolate" is itself one of `isolate_endpoint`'s keywords and near-verbatim to one of its example phrasings, while "block" only appears embedded in longer examples ("Block this IP address"). This is a real inconsistency in a threshold-based classifier on very short inputs, not hidden here — a case where the router's job (classify *what* the user wants) is intentionally decoupled from a separate, unsolved problem (whether required *arguments* like a target IP/host were actually given), left to a future slot-filling / action-planning layer (PLAN's Action Planner box, Phase 7) rather than papered over here.
+
+**Scope boundary:** the router only classifies. It does not attempt to extract a target IP or hostname from a write-intent query — the orchestrator (`app/agent/orchestrator.py`) reports the classification for write intents and explicitly stops there, since there's no RBAC/confirm/execute pipeline (Phase 7) for it to hand off to yet. Building entity extraction now would be building for a pipeline stage that doesn't exist.
+
+---
+
+## 2026-08-16 — Phase 5: tool layer declares RBAC/idempotency/audit contracts before they're enforced
+
+**Decision:** `app/agent/tools.py`'s `Tool` dataclass carries `required_permission`, `idempotent`, and `audit_event` fields on every tool right now, even though nothing reads or enforces them yet (RBAC is Phase 7, the audit log is Phase 8).
+
+**Why:** PLAN §13 asks for tools to declare "authorization requirements, side-effect classification, idempotency behavior, audit event" as part of the tool's definition, not as something bolted on when RBAC is built. Declaring it now means Phase 7's enforcement layer reads a contract that already exists (`if not user.has_permission(tool.required_permission): deny`) instead of hardcoding tool-specific authorization logic when it's built. Concretely: `block_ip` and `isolate_endpoint` are marked `idempotent=True` because blocking an already-blocked IP (once real execution exists) is a safe no-op, not a compounding action — `create_incident` is marked `idempotent=False` because creating two incidents from one duplicated request is a real bug. That distinction has to be decided per-tool by someone who understands what the tool does; better to decide it once, here, than rediscover it under Phase 7 time pressure.
+
+**Eight tools registered, two backed by real retrieval, six stubbed honestly:** `search_knowledge_base` and `search_sigma_rules` call the full validated Phase 4 pipeline (RRF top-20 candidates → cross-encoder rerank). `lookup_ioc`/`get_alert`/`get_incident` return an explicit "no data source yet" error rather than fabricating a plausible-looking empty result. `create_incident`/`block_ip`/`isolate_endpoint` return `{"status": "not_executed", "reason": "...", "proposed_action": {...}}` — the shape a real propose-confirm-execute flow will eventually consume, without pretending to execute anything.
+
+---
+
+## 2026-08-16 — Metadata filtering added to both retrievers (closes a Phase 3 gap)
+
+**Decision:** `BM25Retriever.search()` and `VectorRetriever.search()` both take an optional `doc_type` parameter now; `HybridSearcher.search()` threads it through to both. Post-filter for BM25 (score all rows, then drop non-matching ones before truncating to `limit`), native Qdrant `Filter`/`MatchAny` for the vector side (filtered during the ANN search itself, not after).
+
+**Why now:** this was flagged as a Phase 3 gap blocked on the schema refactor (`doc_type` didn't exist as a queryable field before). It's needed the moment the tool layer exists: `explain_technique` and `search_sigma_rules` are two different tools precisely because one is `search_knowledge_base` filtered to `attack_technique` and the other is filtered to `detection_rule` — without this, those would have to be two separate, duplicated retrieval code paths instead of one parameterized one.
+
+---
+
 ## 2026-08-16 — Hybrid retrieval combined via Reciprocal Rank Fusion (RRF)
 
 **Decision:** Combine BM25 (lexical) and Qdrant (semantic/vector) search results with Reciprocal Rank Fusion, instead of a weighted score blend or a learned re-ranker.

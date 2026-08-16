@@ -13,9 +13,9 @@ class HybridSearcher:
         self.k = k
         self.candidate_limit = candidate_limit
 
-    def search(self, query, limit=10):
-        bm25_results = self.bm25.search(query, limit=self.candidate_limit)
-        vector_results = self.vector.search(query, limit=self.candidate_limit)
+    def search(self, query, limit=10, doc_type=None):
+        bm25_results = self.bm25.search(query, limit=self.candidate_limit, doc_type=doc_type)
+        vector_results = self.vector.search(query, limit=self.candidate_limit, doc_type=doc_type)
         return reciprocal_rank_fusion(
             {"bm25": bm25_results, "vector": vector_results}, k=self.k, limit=limit
         )

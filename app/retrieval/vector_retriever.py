@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from sentence_transformers import SentenceTransformer
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -15,11 +16,18 @@ class VectorRetriever:
         self.collection = collection
         self.model = SentenceTransformer(model_name)
 
-    def search(self, query, limit=10):
+    def search(self, query, limit=10, doc_type=None):
         vector = self.model.encode(query, normalize_embeddings=True)
+        query_filter = None
+        if doc_type is not None:
+            allowed = [doc_type] if isinstance(doc_type, str) else list(doc_type)
+            query_filter = models.Filter(
+                must=[models.FieldCondition(key="doc_type", match=models.MatchAny(any=allowed))]
+            )
         hits = self.client.query_points(
             collection_name=self.collection,
             query=vector,
+            query_filter=query_filter,
             limit=limit,
         ).points
         return [

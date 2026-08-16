@@ -13,9 +13,9 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 0 | Project Scaffolding | `[~]` in progress |
 | 1 | Knowledge Base Ingestion | `[~]` in progress |
 | 2 | Indexing Pipeline | `[~]` in progress |
-| 3 | Retrieval — Dense, Lexical, Hybrid RRF | `[~]` in progress |
+| 3 | Retrieval — Dense, Lexical, Hybrid RRF | `[x]` done |
 | 4 | Reranking & Retrieval Evaluation | `[x]` done |
-| 5 | Intent Routing & Agent/Tool Layer | `[ ]` not started |
+| 5 | Intent Routing & Agent/Tool Layer | `[x]` done (initial slice) |
 | 6 | Generation & Groundedness | `[ ]` not started |
 | 7 | RBAC, Guardrails, Propose→Confirm→Execute | `[ ]` not started |
 | 8 | Persistence, Audit, API Layer | `[ ]` not started |
@@ -23,7 +23,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Phase 4 is done, and the Phase 1 schema gap flagged afterward is now closed too.** Retrieval (BM25 + vector + RRF + cross-encoder rerank) is fully built and measured end to end, and every document now carries a consistent `{document_id, doc_type, source, title, content, metadata}` shape with MITRE tactics and Sigma ATT&CK mappings actually extracted (not just sitting in raw text). **Next up: Phase 5** (intent routing + agent/tool layer) — see "Recommendation" at the bottom.
+**Phase 5 is done.** Retrieval (Phases 2-4), the document schema refactor, metadata-filtered retrieval (closing the last Phase 3 gap), and now the intent router + tool layer are all built, wired together, and verified end to end via `app/agent/orchestrator.py`. Building the router's first natural-language query also surfaced and fixed a real latent bug in BM25 tokenization (see [DECISIONS.md](DECISIONS.md)) that had been silently present since Phase 2. **Next up: Phase 6** (generation + groundedness) — see "Recommendation" at the bottom.
 
 ---
 
@@ -54,11 +54,11 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 - [x] Reproducible — both scripts are idempotent re-runs from `documents.json`
 - [ ] Corpus/index version recorded (e.g. a version stamp or doc-count/hash written alongside the index) — not implemented; no way to tell if an index is stale relative to `documents.json` without rebuilding
 
-## Phase 3 — Retrieval: Dense, Lexical, Hybrid RRF *(PLAN §7, §8, §9)*
+## Phase 3 — Retrieval: Dense, Lexical, Hybrid RRF *(PLAN §7, §8, §9)* — DONE
 
-- [~] **Dense retrieval (Qdrant)** — `app/retrieval/vector_retriever.py`. *Deviation:* plan specifies `BAAI/bge-small-en-v1.5`; current implementation uses `all-MiniLM-L6-v2` (carried over from the original indexing script). Both are reasonable small sentence-transformer models — worth an explicit decision on which to standardize on rather than leaving it implicit.
-- [ ] Metadata filtering (only-MITRE / only-Sigma / only-runbook search) — not implemented yet, but no longer blocked: `doc_type` is now in both the BM25 meta sidecar and the Qdrant payload; just needs a `filter` param added to `BM25Retriever.search`/`VectorRetriever.search`
-- [x] **Lexical retrieval (BM25)** — `app/retrieval/bm25_retriever.py`, returns id/rank/score
+- [~] **Dense retrieval (Qdrant)** — `app/retrieval/vector_retriever.py`. *Deviation:* plan specifies `BAAI/bge-small-en-v1.5`; current implementation uses `all-MiniLM-L6-v2` (carried over from the original indexing script). Both are reasonable small sentence-transformer models — a documented choice, not a gap, so it doesn't block calling this phase done.
+- [x] Metadata filtering (only-MITRE / only-Sigma / only-attack_technique / only-detection_rule search) — `doc_type` param added to `BM25Retriever.search`/`VectorRetriever.search`/`HybridSearcher.search`. BM25 post-filters candidates before truncating to `limit`; Qdrant uses a native `Filter`/`MatchAny` during the ANN search itself. Verified: filtering "credential dumping" to `attack_technique` vs `detection_rule` returns disjoint, correctly-typed result sets.
+- [x] **Lexical retrieval (BM25)** — `app/retrieval/bm25_retriever.py`, returns document_id/rank/score. Tokenizer now strips English stopwords — see the bug entry in [DECISIONS.md](DECISIONS.md); this was found and fixed during Phase 5, not here, but belongs to this phase's component.
 - [x] **Hybrid RRF** — `app/retrieval/fusion.py` + `app/retrieval/hybrid.py`, configurable `k` (default 60), documented in [DECISIONS.md](DECISIONS.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
 - [x] Fused result exposes rank per retriever (plan §9 requirement) — `reciprocal_rank_fusion` now takes a `{name: ranked_list}` dict and returns a `"ranks"` field per doc, e.g. `{"bm25": 2, "vector": 7}`, with entries omitted for retrievers that didn't return the doc. Verified against live queries: `T1059` resolves via BM25 alone (vector's #1 for that query is the false friend `T1065`), giving a concrete "one retriever wins" example for the Phase 4 eval.
 
@@ -73,12 +73,17 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 **Aggregate results (K=10):** BM25 recall@10 0.645 / vector 0.494 / RRF 0.645 (MRR 0.933) / RRF+rerank **0.682 recall@10, 1.000 MRR** — reranking gives a further lift on top of RRF as expected, confirming the hybrid+rerank pipeline over either single method. Relevance judgments are a title-substring heuristic, not hand-labeled — see DECISIONS.md for why and its limits.
 
-## Phase 5 — Intent Routing & Agent/Tool Layer *(PLAN §12, §13)*
+## Phase 5 — Intent Routing & Agent/Tool Layer *(PLAN §12, §13)* — DONE (initial slice)
 
-- [ ] Intent router (read intents: explain technique, search detection rule, investigate alert, lookup IOC, search runbook, explain log, summarize incident, search threat intel; write intents: create incident, block IP, isolate endpoint, add IOC, close incident)
-- [ ] Confidence-aware cascade (lexical/IDF → semantic → hybrid → threshold → escalate/clarify)
-- [ ] Tool definitions with schema, typed input, authz requirements, side-effect classification, idempotency behavior, audit event (`search_knowledge_base`, `search_sigma_rules`, `lookup_ioc`, `get_alert`, `get_incident`, `create_incident`, `block_ip`, `isolate_endpoint`)
-- [ ] Mocked/local tool implementations
+- [x] Intent router — `app/agent/router.py`, `IntentRouter`. 5 intents (`explain_technique`, `search_detection_rule`, `search_knowledge_base` read; `block_ip`, `isolate_endpoint` write), deliberately smaller than PLAN's full 20+-intent read/write list per §12's own instruction to "start with a smaller set and make the architecture extensible" — the remaining PLAN-listed intents (investigate alert, lookup IOC, search runbook, explain log, summarize incident, search threat intel, create incident, add IOC, close incident) aren't routable yet because their backing data/tools don't exist (Phase 1 runbooks/alerts, Phase 8 incidents).
+- [x] Confidence-aware cascade (lexical/keyword signal → semantic similarity vs. example utterances → combined score → confidence **and** margin threshold, stricter for write intents → `clarify` when uncertain) — matches PLAN §12's cascade exactly. Verified against deliberately adversarial queries: `"block"` alone correctly falls to `clarify` (0.54 vs the 0.55 write threshold); `"What sigma rule covers T1003"` correctly falls to `clarify` on a margin tie between two legitimately valid intents, not a confidence failure.
+- [x] Tool definitions with schema, typed (pydantic) input, authz requirement (declared, not yet enforced), side-effect classification, idempotency behavior (declared), audit event (declared) — `app/agent/tools.py`, all 8 of PLAN §13's initial tools registered.
+- [x] Mocked/local tool implementations — 2 real (`search_knowledge_base`, `search_sigma_rules`, both backed by the full RRF+rerank pipeline), 3 stubs reporting "no data source yet" (`lookup_ioc`, `get_alert`, `get_incident`), 3 stubs reporting "not executed, RBAC/confirm pipeline not built" (`create_incident`, `block_ip`, `isolate_endpoint`).
+- [x] `app/agent/orchestrator.py` ties router + registry together end to end (`Orchestrator.handle(query)`), verified against real queries.
+
+**Bug found and fixed along the way:** the router's first real natural-language query (`"What is T1059?"`) exposed a latent defect in BM25 tokenization present since Phase 2 — classic Okapi BM25's IDF goes negative for stopwords appearing in most of the corpus, so "is"/"what" were actively penalizing correct results, invisible until a query used them. Fixed by stopword-filtering `tokenize()` (now a single shared function, previously duplicated between `scripts/index_bm25.py` and `app/retrieval/bm25_retriever.py`). Full retrieval eval re-run after the fix: aggregate numbers flat-to-slightly-improved (RRF+rerank recall@10 0.682 → 0.687), no regression. Full writeup in [DECISIONS.md](DECISIONS.md).
+
+**Scope boundary, explicit:** the router classifies intent; it does not extract structured arguments (target IP, hostname) from write queries. For write intents, `Orchestrator` reports the classification and stops — there's no RBAC/confirm/execute pipeline (Phase 7) to hand off to yet, so building slot-filling now would be building for a stage that doesn't exist.
 
 ## Phase 6 — Read Workflows: Generation & Groundedness *(PLAN §14, §15, §16)*
 
@@ -126,8 +131,9 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 ## Recommendation: what to do next
 
-Retrieval (Phases 2–4) and the document schema (Phase 1's `doc_type`/`metadata` gap) are both done and measured now — nothing structural is left blocking the agentic half of the project. **Move to Phase 5** (intent router): the natural entry point into everything that follows, since Phase 6 onward (generation, groundedness, RBAC, propose-confirm-execute) all depend on knowing whether a request is a read or a write before anything else happens.
+Retrieval (Phases 2-4), the document schema, and the intent router + tool layer (Phase 5) are all done and verified now. **Move to Phase 6** (generation + groundedness): the router already routes a confident read query to a tool that returns ranked evidence — the missing piece is turning that evidence into an actual cited answer instead of a raw result list, which is what `Orchestrator`'s output is standing in for right now.
 
-Two items remain deliberately deferred, not because they're hard but because nothing downstream needs them yet:
-- **Runbooks and alert/event data** (rest of Phase 1) — the schema is ready to receive both (`doc_type: "runbook"` / `"security_alert"`, documented in ARCHITECTURE.md), but building the actual corpora is only worth doing once something (Phase 5's "search runbook" intent, Phase 11's demo scenario) will actually consume them.
-- **Metadata-filtered retrieval** (Phase 3) — `doc_type` now exists in both indices, so this is a small addition whenever a concrete need for it shows up (e.g. Phase 5 routing a "search runbook" intent to a `doc_type`-filtered query) rather than something to build speculatively now.
+Deliberately still deferred, not because they're hard but because nothing downstream needs them yet:
+- **Runbooks and alert/event data** (rest of Phase 1) — schema-ready, corpus not built; worth doing once a `search_runbook`/`investigate_alert` intent actually needs something to search.
+- **Entity/slot extraction for write intents** (surfaced explicitly in Phase 5) — needed before Phase 7's propose-confirm-execute can do anything with a classified write intent, but building it before Phase 7 exists means building for a pipeline stage with nothing to hand off to.
+- **RRF `k` retuning for natural-language exact-ID queries** (surfaced while fixing the BM25 bug, see DECISIONS.md) — a characterized, not fixed, limitation. Worth a dedicated pass through the eval script if it matters enough, not a side effect of unrelated work.

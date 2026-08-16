@@ -1,20 +1,18 @@
 import json
 import pickle
-import re
+import sys
 from pathlib import Path
 
 from rank_bm25 import BM25Okapi
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from app.retrieval.bm25_retriever import tokenize  # noqa: E402 -- single source of truth, see its docstring comment
+
 DOCS_PATH = ROOT / "data" / "documents.json"
 BM25_PATH = ROOT / "data" / "bm25_index.pkl"
 META_PATH = ROOT / "data" / "bm25_meta.json"
-
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
-
-
-def tokenize(text):
-    return _TOKEN_RE.findall(text.lower())
 
 
 def native_id(doc):
