@@ -23,7 +23,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Next up: finish Phase 3** (fusion rank metadata + source filtering), or jump straight to **Phase 4** (cross-encoder reranking + eval set) since RRF is functionally working — see "Recommendation" at the bottom.
+**Next up: Phase 4** (cross-encoder reranking + eval set). The two prep items blocking it (per-retriever rank exposure in RRF output, `git init`) are done — see "Recommendation" at the bottom for what's still deliberately deferred.
 
 ---
 
@@ -31,7 +31,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 - [x] `requirements.txt` with core deps (fastapi, uvicorn, sentence-transformers, qdrant-client, rank-bm25, pydantic, pyyaml, pysigma)
 - [x] `data/`, `scripts/`, `app/retrieval/` directories exist
-- [ ] `git init` — **repo is not under version control yet**
+- [x] `git init` — repo initialized, `.gitignore` excludes `.venv/`, build artifacts (`documents.json`, BM25/Qdrant indices), the cloned `data/sigma/` repo, and the raw `enterprise-attack.json` dump (51MB, no fetch script yet)
 - [~] `README.md` — currently a one-line stub, not project-descriptive
 - [ ] `app/api/`, `app/agent/`, `app/generation/`, `app/actions/`, `app/auth/`, `app/database/`, `app/audit/`, `frontend/`, `tests/`, `docker-compose.yml`, `Dockerfile` — none of these exist yet (expected; later phases)
 
@@ -59,7 +59,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 - [ ] Metadata filtering (only-MITRE / only-Sigma / only-runbook search) — not implemented; needs `doc_type` in payload (blocked by Phase 1 schema gap) plus a `filter` param on `VectorRetriever.search`
 - [x] **Lexical retrieval (BM25)** — `app/retrieval/bm25_retriever.py`, returns id/rank/score
 - [x] **Hybrid RRF** — `app/retrieval/fusion.py` + `app/retrieval/hybrid.py`, configurable `k` (default 60), documented in [DECISIONS.md](DECISIONS.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
-- [ ] Fused result should expose **both** `bm25_rank` and `dense_rank` per doc (plan §9 requirement) — current `reciprocal_rank_fusion` returns only the fused `rrf_score` plus whichever retriever's dict happened to register the doc first; doesn't yet surface "present in BM25 at rank X, present in dense at rank Y" side by side
+- [x] Fused result exposes rank per retriever (plan §9 requirement) — `reciprocal_rank_fusion` now takes a `{name: ranked_list}` dict and returns a `"ranks"` field per doc, e.g. `{"bm25": 2, "vector": 7}`, with entries omitted for retrievers that didn't return the doc. Verified against live queries: `T1059` resolves via BM25 alone (vector's #1 for that query is the false friend `T1065`), giving a concrete "one retriever wins" example for the Phase 4 eval.
 
 ## Phase 4 — Reranking & Retrieval Evaluation *(PLAN §10, §11)*
 
