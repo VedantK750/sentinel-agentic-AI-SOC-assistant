@@ -14,7 +14,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 1 | Knowledge Base Ingestion | `[~]` in progress |
 | 2 | Indexing Pipeline | `[~]` in progress |
 | 3 | Retrieval — Dense, Lexical, Hybrid RRF | `[~]` in progress |
-| 4 | Reranking & Retrieval Evaluation | `[ ]` not started |
+| 4 | Reranking & Retrieval Evaluation | `[x]` done |
 | 5 | Intent Routing & Agent/Tool Layer | `[ ]` not started |
 | 6 | Generation & Groundedness | `[ ]` not started |
 | 7 | RBAC, Guardrails, Propose→Confirm→Execute | `[ ]` not started |
@@ -23,7 +23,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Next up: Phase 4** (cross-encoder reranking + eval set). The two prep items blocking it (per-retriever rank exposure in RRF output, `git init`) are done — see "Recommendation" at the bottom for what's still deliberately deferred.
+**Phase 4 is done.** Retrieval (BM25 + vector + RRF + cross-encoder rerank) is now fully built and measured end to end. **Next up: Phase 5** (intent routing + agent/tool layer) — see "Recommendation" at the bottom.
 
 ---
 
@@ -61,14 +61,16 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 - [x] **Hybrid RRF** — `app/retrieval/fusion.py` + `app/retrieval/hybrid.py`, configurable `k` (default 60), documented in [DECISIONS.md](DECISIONS.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
 - [x] Fused result exposes rank per retriever (plan §9 requirement) — `reciprocal_rank_fusion` now takes a `{name: ranked_list}` dict and returns a `"ranks"` field per doc, e.g. `{"bm25": 2, "vector": 7}`, with entries omitted for retrievers that didn't return the doc. Verified against live queries: `T1059` resolves via BM25 alone (vector's #1 for that query is the false friend `T1065`), giving a concrete "one retriever wins" example for the Phase 4 eval.
 
-## Phase 4 — Reranking & Retrieval Evaluation *(PLAN §10, §11)*
+## Phase 4 — Reranking & Retrieval Evaluation *(PLAN §10, §11)* — DONE
 
-- [ ] Cross-encoder reranker over RRF's top candidates
-- [ ] Expose initial rank / reranker score / final rank per result
-- [ ] Fixed evaluation query set (T1059, credential dumping, powershell execution, curl file upload, mimikatz, ransomware, phishing, lsass, disable defender, reverse shell)
-- [ ] Compare Qdrant-only vs. BM25-only vs. RRF vs. RRF+cross-encoder
-- [ ] Track Recall@K, Hit@K, MRR
-- [ ] Keep qualitative "one retriever wins, other fails" examples
+- [x] Cross-encoder reranker over RRF's top candidates — `app/retrieval/reranker.py`, `cross-encoder/ms-marco-MiniLM-L-6-v2` (general-purpose, not domain-tuned — see [DECISIONS.md](DECISIONS.md))
+- [x] Expose initial rank / reranker score / final rank per result
+- [x] Fixed evaluation query set (T1059, credential dumping, powershell execution, curl file upload, mimikatz, ransomware, phishing, lsass, disable defender, reverse shell) — `scripts/evaluate_retrieval.py`
+- [x] Compare BM25-only vs. vector-only vs. RRF vs. RRF+cross-encoder
+- [x] Track Recall@K, Hit@K, MRR (K=10)
+- [x] Keep qualitative "one retriever wins, other fails" examples — `T1059` is a **complete vector-only failure** (0.00 on every metric), fully recovered by BM25/RRF; see [DECISIONS.md](DECISIONS.md) for the full results table
+
+**Aggregate results (K=10):** BM25 recall@10 0.645 / vector 0.494 / RRF 0.645 (MRR 0.933) / RRF+rerank **0.682 recall@10, 1.000 MRR** — reranking gives a further lift on top of RRF as expected, confirming the hybrid+rerank pipeline over either single method. Relevance judgments are a title-substring heuristic, not hand-labeled — see DECISIONS.md for why and its limits.
 
 ## Phase 5 — Intent Routing & Agent/Tool Layer *(PLAN §12, §13)*
 
@@ -123,9 +125,9 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 ## Recommendation: what to do next
 
-Phase 3 (hybrid retrieval) is functionally solid — RRF works and returns good results. Two things are worth closing out before moving on, because later phases build on top of them:
+Retrieval (Phases 2–4) is now complete and measured — BM25, vector, RRF, and cross-encoder reranking all work and the eval script proves the hybrid+rerank pipeline earns its complexity. Before moving into Phase 5 (intent routing), one deferred item from Phase 1 is worth revisiting now rather than later:
 
-1. **Add `doc_type` + `metadata` to the document schema now** (Phase 1 gap). Runbooks and alerts (Phase 1, still unbuilt) will be new `doc_type`s, and source-filtered retrieval (Phase 3 gap) and citation formatting (Phase 6) both key off it. Retrofitting this after more phases are built means touching the parsers, both indexers, and both retrievers all over again.
-2. **Then move to Phase 4** (cross-encoder reranking + a real eval set) — the plan explicitly wants to *demonstrate* why hybrid retrieval + reranking beats either method alone, and doing this before generation exists means the retrieval story can be validated in isolation, with numbers, instead of being buried inside end-to-end demo output later.
+1. **Add `doc_type` + `metadata` to the document schema.** Runbooks and alerts (Phase 1, still unbuilt) will be new `doc_type`s; source-filtered retrieval (Phase 3 gap) and citation formatting (Phase 6) both key off it; and the intent router (Phase 5) will likely want to route certain intents ("search runbook") to a `doc_type`-filtered search. Retrofitting this after the agent/tool layer and generation are built means touching the parsers, both indexers, both retrievers, and the eval script all over again.
+2. **Then Phase 5** (intent router) — the natural entry point into the agentic half of the project. Everything from Phase 6 onward (generation, groundedness, RBAC, propose-confirm-execute) depends on knowing whether a request is a read or a write before anything else happens.
 
-After that, Phase 5 (intent router) is the natural entry point into the agentic half of the project — everything from Phase 6 onward depends on knowing whether a request is a read or a write.
+Runbooks and alert/event data (the rest of Phase 1) can stay deferred until the schema exists to receive them — no reason to build a corpus for a schema that isn't ready yet.

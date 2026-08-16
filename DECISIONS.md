@@ -33,6 +33,43 @@ A doc missing from a list contributes 0 from that list. Docs are then re-sorted 
 
 ---
 
+## 2026-08-16 — Cross-encoder reranker: `cross-encoder/ms-marco-MiniLM-L-6-v2`, general-purpose not domain-tuned
+
+**Decision:** Rerank RRF's top candidates with `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers.CrossEncoder` (`app/retrieval/reranker.py`), rather than a security-domain-tuned reranker or a larger cross-encoder.
+
+**Why:**
+- It's small (~80MB) and fast enough to rerank 20 candidates per query with no meaningful latency budget concern, matching PLAN §10's instruction to "only rerank a limited candidate set to keep latency reasonable."
+- It's the standard, well-benchmarked baseline cross-encoder (trained on MS MARCO passage ranking) — a reasonable default when no security-domain-labeled pair data exists to fine-tune one.
+- Same `sentence-transformers` dependency already used for the bi-encoder (`all-MiniLM-L6-v2`), no new library.
+
+**Known limitation, confirmed empirically:** this model has no security-domain knowledge. Smoke-testing `T1059` (see `python -m app.retrieval.reranker`) pulled "Malicious IP Address Sign-In Suspicious" up to rank 3 — a generic-language match, not a real technique-ID relevance signal. The eval results below quantify that this is a net win on average, but it's not uniformly correct. A future domain fine-tune (on ATT&CK/Sigma query→doc pairs) is the natural next improvement once there's enough labeled data — tracked as a future-ideas item, not required for the current phase.
+
+**Result carries `initial_rank`, `reranker_score`, and `final_rank` per PLAN §10**, so the eval script and any future debugging can see exactly how much reranking moved a given doc.
+
+---
+
+## 2026-08-16 — Retrieval eval set uses title-substring relevance rules, not hand-labeled judgments
+
+**Decision:** `scripts/evaluate_retrieval.py` judges a document "relevant" to one of PLAN §11's ten fixed queries via a title-substring rule (e.g. `"mimikatz"` relevant ⇔ title contains "mimikatz"; `"T1059"` relevant ⇔ `id == "T1059"` exactly) rather than manually hand-picking a gold relevance set per query.
+
+**Why:**
+- No labeled relevance data exists for this corpus yet, and hand-labeling is subjective and easy to unconsciously bias toward whichever retriever you eyeballed first.
+- A rule expressed in code is transparent, reproducible, and automatically stays in sync if the corpus changes (rerun the script, judgments regenerate) — a hardcoded ID list would silently go stale.
+- Explicit tradeoff accepted: title-substring matching is a proxy, not true relevance. It undercounts docs that are relevant in content but don't happen to repeat the query term in the title, and overcounts near-miss titles that share vocabulary without matching intent. Good enough to compare *retrieval methods against each other* on equal footing (which is the eval's actual purpose per PLAN §11 — "demonstrate why hybrid retrieval was chosen"), not good enough to claim absolute recall/precision numbers as ground truth.
+
+**Results (K=10, aggregate over 10 queries):**
+
+| method | Hit@10 | Recall@10 | MRR |
+|---|---|---|---|
+| BM25 only | 1.000 | 0.645 | 1.000 |
+| Vector only | 0.900 | 0.494 | 0.764 |
+| RRF (BM25+vector) | 1.000 | 0.645 | 0.933 |
+| RRF + cross-encoder rerank | 1.000 | **0.682** | 1.000 |
+
+The clearest single data point: for the exact-ID query `"T1059"`, vector-only search scores **0.00 on every metric** — the embedding model doesn't retrieve the technique at all in its top 10. BM25 and RRF recover it perfectly. This is direct, measured confirmation of the reasoning in the RRF decision above (not just the a-priori argument) — hybrid retrieval isn't optional here, vector-only search has a real blind spot on this corpus. Reranking then adds a further, smaller lift on top of RRF (+0.037 recall@10, MRR 0.933 → 1.000), consistent with reranking's job being precision refinement on an already-reasonable candidate set rather than a substitute for retrieval.
+
+---
+
 ## 2026-08-16 — RRF fusion is keyed by retriever name, not positional list order
 
 **Decision:** `reciprocal_rank_fusion` takes a `dict[str, list]` (e.g. `{"bm25": ..., "vector": ...}`) instead of a plain list of ranked lists, and returns a `"ranks"` dict per fused result recording which retriever(s) surfaced that doc and at what rank.
