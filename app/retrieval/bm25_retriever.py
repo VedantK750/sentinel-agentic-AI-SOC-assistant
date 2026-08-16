@@ -26,8 +26,9 @@ class BM25Retriever:
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:limit]
         return [
             {
-                "id": self.meta[i]["id"],
+                "document_id": self.meta[i]["document_id"],
                 "title": self.meta[i]["title"],
+                "doc_type": self.meta[i]["doc_type"],
                 "source": self.meta[i]["source"],
                 "score": float(score),
             }

@@ -33,6 +33,25 @@ A doc missing from a list contributes 0 from that list. Docs are then re-sorted 
 
 ---
 
+## 2026-08-16 — Document schema refactor: `{document_id, doc_type, source, title, content, metadata}`
+
+**Decision:** Every document in `documents.json` now has exactly six top-level fields — `document_id`, `doc_type`, `source` (an object, provenance only), `title`, `content`, `metadata` — replacing the old flat `{id, title, content, source, raw}` shape. `parse_mitre.py` and `parse_sigma.py` were rewritten to populate it; `index_bm25.py`, `index_qdrant.py`, and the entire `app/retrieval/` layer were updated to consume the new field names.
+
+**Why now, before Phase 5:** flagged as a deferred gap after Phase 4 — closing it before the intent router (Phase 5) and generation (Phase 6) avoids retrofitting the parsers, both indexers, and every retrieval file a second time once more code depends on the old shape. See the "Phase 1 schema gap" explanation from the prior conversation turn for the concrete problems this fixes (Sigma `tags` → ATT&CK technique mappings were sitting unparsed in a raw YAML blob; MITRE `kill_chain_phases` → tactic was being discarded entirely).
+
+**Design choices:**
+- **`document_id` is namespaced and stable**: `mitre_attack:T1059`, `sigma:<rule-uuid>` — globally unique across doc types by construction (source-specific IDs alone aren't guaranteed unique once more sources join the corpus), while the original source-specific ID is *also* preserved unambiguously in `metadata` (`technique_id`, `rule_id`) rather than needing to be parsed back out of the composite ID string.
+- **`source` is provenance-only, never identity or type.** It's `{"name": ..., "url"/"repo"/"path": ...}` — enough to trace a document back to exactly where it came from (MITRE's URL for that technique; the Sigma rule's file path within the cloned repo), but the code never branches on it. That's what `doc_type` is for. Conflating "where it's from" with "what it is" was the root cause of the old schema's `source == "SigmaHQ Sigma"` string-equality checks scattered through `parse_sigma.py`'s merge logic — replaced with `doc_type != "detection_rule"`, which stays correct as more sources are added per type.
+- **`content` stays pure search text; structure moves to `metadata`.** Nothing that should be filtered or joined on (technique ID, tactic, log source, ATT&CK mapping) lives only in `content` anymore — it's extracted into `metadata` as real fields, while `content` keeps just enough of that information in prose form (e.g. `"Tags: attack.discovery, attack.t1082"` appended to a Sigma rule's content) to stay useful for BM25/embedding search, which was already working well and shouldn't regress.
+- **Sigma's `raw` YAML moved into `metadata.raw`** — demoted from "the only place the tags/logsource/etc. live" to "one metadata field among several, kept for traceability." Nothing parses `content` or `raw` to *extract* structure anymore; extraction happens once, in the parser, into dedicated fields.
+- **Extensibility validated by design, not by building the corpora yet**: runbooks and synthetic alerts (PLAN §4.3/§4.4) are still unbuilt, but the schema was checked against both shapes on paper (documented in ARCHITECTURE.md) — a `doc_type: "runbook"` or `"security_alert"` document needs no change to the six top-level fields, only a different `metadata` shape, and no change at all to the indexers or retrievers (which never touch `metadata` internals, only pass it through).
+
+**Verified non-regression:** after rebuilding both indices and rerunning the exact same smoke queries used throughout Phase 2–4, BM25 scores, RRF fusion output, and reranker scores are numerically identical to pre-refactor runs (only the `id` values changed shape, e.g. `T1059` → `mitre_attack:T1059`) — confirming this was a pure schema/plumbing change with no effect on ranking behavior. The full retrieval eval (`scripts/evaluate_retrieval.py`) reproduces the exact same aggregate table (BM25 recall@10 0.645, RRF+rerank 0.682/MRR 1.000) as the pre-refactor run documented above.
+
+**New:** `scripts/validate_documents.py` checks required fields, `document_id` uniqueness, and — the part that actually matters — that extraction is *working*: ≥95% of `attack_technique` docs must have non-empty `metadata.tactics` (measured: 100%), ≥50% of `detection_rule` docs must have non-empty `metadata.attack_techniques` (measured: 89%). The 50% floor is deliberately well below the measured 89% — not every Sigma rule maps to an ATT&CK technique, so the check verifies extraction isn't broken, not that coverage is complete.
+
+---
+
 ## 2026-08-16 — Cross-encoder reranker: `cross-encoder/ms-marco-MiniLM-L-6-v2`, general-purpose not domain-tuned
 
 **Decision:** Rerank RRF's top candidates with `cross-encoder/ms-marco-MiniLM-L-6-v2` via `sentence-transformers.CrossEncoder` (`app/retrieval/reranker.py`), rather than a security-domain-tuned reranker or a larger cross-encoder.

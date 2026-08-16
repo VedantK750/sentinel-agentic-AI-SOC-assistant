@@ -35,7 +35,7 @@ def main():
         print(f"\nquery: {query!r}")
         for r in results:
             ranks = " ".join(f"{name}#{rank}" for name, rank in r["ranks"].items())
-            print(f"  {r['rrf_score']:.4f}  {r['id']}  {r['title']}  ({r['source']})  [{ranks}]")
+            print(f"  {r['rrf_score']:.4f}  {r['document_id']}  {r['title']}  ({r['source']})  [{ranks}]")
 
 
 if __name__ == "__main__":

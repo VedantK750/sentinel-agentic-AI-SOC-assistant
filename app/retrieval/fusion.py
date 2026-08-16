@@ -2,8 +2,8 @@ def reciprocal_rank_fusion(ranked_lists, k=60, limit=10):
     """Fuse multiple named ranked result lists into one ranking by rank position, not raw score.
 
     `ranked_lists` is a dict mapping a retriever name (e.g. "bm25", "vector") to its
-    results — a sequence of dicts with an "id" key, already sorted best-first by that
-    retriever. A doc's fused score is the sum of 1/(k + rank) across every list it
+    results — a sequence of dicts with a "document_id" key, already sorted best-first
+    by that retriever. A doc's fused score is the sum of 1/(k + rank) across every list it
     appears in (rank is 1-indexed), so a document ranked highly by multiple retrievers
     rises even if their raw scores are on incomparable scales.
 
@@ -17,7 +17,7 @@ def reciprocal_rank_fusion(ranked_lists, k=60, limit=10):
     ranks = {}
     for name, ranked in ranked_lists.items():
         for rank, doc in enumerate(ranked, start=1):
-            doc_id = doc["id"]
+            doc_id = doc["document_id"]
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
             docs.setdefault(doc_id, doc)
             ranks.setdefault(doc_id, {})[name] = rank

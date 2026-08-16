@@ -12,17 +12,17 @@ class CrossEncoderReranker:
     def __init__(self, model_name=MODEL_NAME, docs_path=DOCS_PATH):
         self.model = CrossEncoder(model_name)
         documents = json.loads(Path(docs_path).read_text(encoding="utf-8"))
-        self.content_by_id = {doc["id"]: doc.get("content", "") for doc in documents}
+        self.content_by_id = {doc["document_id"]: doc.get("content", "") for doc in documents}
 
     def rerank(self, query, candidates, limit=10):
-        """Re-score `candidates` (ranked dicts with an "id"/"title" key, e.g. RRF
-        output) against the full query+document text with a cross-encoder, and
+        """Re-score `candidates` (ranked dicts with a "document_id"/"title" key, e.g.
+        RRF output) against the full query+document text with a cross-encoder, and
         return the top `limit` re-sorted by that score. Each result keeps its
         `initial_rank` (position coming in) alongside the new `reranker_score` and
         `final_rank`, so callers can see how much reranking actually moved things.
         """
         pairs = [
-            (query, f"{c['title']}. {self.content_by_id.get(c['id'], '')}")
+            (query, f"{c['title']}. {self.content_by_id.get(c['document_id'], '')}")
             for c in candidates
         ]
         scores = self.model.predict(pairs)
@@ -57,7 +57,7 @@ def main():
             moved = r["initial_rank"] - r["final_rank"]
             print(
                 f"  final#{r['final_rank']}  (was RRF#{r['initial_rank']}, {moved:+d})"
-                f"  score={r['reranker_score']:.3f}  {r['id']}  {r['title']}"
+                f"  score={r['reranker_score']:.3f}  {r['document_id']}  {r['title']}"
             )
 
 

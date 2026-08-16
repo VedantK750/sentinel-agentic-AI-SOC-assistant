@@ -22,7 +22,7 @@ METHODS = ["bm25", "vector", "rrf", "rrf+rerank"]
 # a title-substring heuristic used as a reproducible proxy for ground truth in
 # the absence of hand-labeled relevance judgments. See DECISIONS.md.
 EVAL_QUERIES = [
-    {"query": "T1059", "id_equals": "T1059"},
+    {"query": "T1059", "technique_id_equals": "T1059"},
     {"query": "credential dumping", "terms": ["credential dump"]},
     {"query": "powershell execution", "terms": ["powershell", "execution"]},
     {"query": "curl file upload", "terms": ["curl", "upload"]},
@@ -42,8 +42,14 @@ EVAL_QUERIES = [
 def build_relevance_sets(documents):
     relevance = {}
     for spec in EVAL_QUERIES:
-        if "id_equals" in spec:
-            relevance[spec["query"]] = {spec["id_equals"]}
+        if "technique_id_equals" in spec:
+            relevant = {
+                doc["document_id"]
+                for doc in documents
+                if doc.get("doc_type") == "attack_technique"
+                and doc.get("metadata", {}).get("technique_id") == spec["technique_id_equals"]
+            }
+            relevance[spec["query"]] = relevant
             continue
         relevant = set()
         for doc in documents:
@@ -52,7 +58,7 @@ def build_relevance_sets(documents):
                 continue
             if "any_terms" in spec and not any(t in title for t in spec["any_terms"]):
                 continue
-            relevant.add(doc["id"])
+            relevant.add(doc["document_id"])
         relevance[spec["query"]] = relevant
     return relevance
 
@@ -102,10 +108,10 @@ def main():
         reranked = reranker.rerank(query, rrf_results, limit=K)
 
         runs = {
-            "bm25": [d["id"] for d in bm25_results],
-            "vector": [d["id"] for d in vector_results],
-            "rrf": [d["id"] for d in rrf_results],
-            "rrf+rerank": [d["id"] for d in reranked],
+            "bm25": [d["document_id"] for d in bm25_results],
+            "vector": [d["document_id"] for d in vector_results],
+            "rrf": [d["document_id"] for d in rrf_results],
+            "rrf+rerank": [d["document_id"] for d in reranked],
         }
 
         for method in METHODS:

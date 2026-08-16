@@ -14,13 +14,20 @@ BATCH_SIZE = 100
 VECTOR_SIZE = 384
 
 
+def native_id(doc):
+    """See scripts/index_bm25.py:native_id -- same rationale, kept consistent
+    so BM25 and vector indexing embed/weight the same identifier text.
+    """
+    metadata = doc.get("metadata", {})
+    return metadata.get("technique_id") or metadata.get("rule_id") or doc["document_id"]
+
+
 def build_texts(documents):
     texts = []
     for doc in documents:
-        doc_id = doc.get("id", "")
         title = doc.get("title", "")
         content = doc.get("content", "")
-        texts.append(f"{doc_id}. {title}. {content}".strip())
+        texts.append(f"{native_id(doc)}. {title}. {content}".strip())
     return texts
 
 
@@ -50,9 +57,10 @@ def main():
                 id=start + i,
                 vector=vectors[i].tolist(),
                 payload={
-                    "id": batch_docs[i]["id"],
+                    "document_id": batch_docs[i]["document_id"],
                     "title": batch_docs[i]["title"],
-                    "source": batch_docs[i]["source"],
+                    "doc_type": batch_docs[i]["doc_type"],
+                    "source": batch_docs[i]["source"]["name"],
                 },
             )
             for i in range(len(batch_texts))
@@ -72,7 +80,7 @@ def main():
         print(f"\nquery: {query!r}")
         for hit in hits:
             print(
-                f"  {hit.score:.4f}  {hit.payload['id']}  {hit.payload['title']}"
+                f"  {hit.score:.4f}  {hit.payload['document_id']}  {hit.payload['title']}"
             )
 
 

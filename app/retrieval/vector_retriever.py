@@ -24,8 +24,9 @@ class VectorRetriever:
         ).points
         return [
             {
-                "id": hit.payload["id"],
+                "document_id": hit.payload["document_id"],
                 "title": hit.payload["title"],
+                "doc_type": hit.payload["doc_type"],
                 "source": hit.payload["source"],
                 "score": float(hit.score),
             }

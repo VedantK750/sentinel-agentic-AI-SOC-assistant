@@ -17,16 +17,25 @@ def tokenize(text):
     return _TOKEN_RE.findall(text.lower())
 
 
+def native_id(doc):
+    """The source-specific identifier (ATT&CK technique ID, Sigma rule ID) --
+    what the old flat "id" field used to hold before the document_id schema
+    refactor. Repeated in the corpus text below to keep exact-ID lookups
+    (e.g. "T1059") weighted the way they were before the refactor.
+    """
+    metadata = doc.get("metadata", {})
+    return metadata.get("technique_id") or metadata.get("rule_id") or doc["document_id"]
+
+
 def build_corpus(documents):
     tokenized = []
     for doc in documents:
-        doc_id = doc.get("id", "")
         combined = " ".join(
             [
-                *([doc_id] * 10),
+                *([native_id(doc)] * 10),
                 doc.get("title", ""),
                 doc.get("content", ""),
-                doc.get("raw", ""),
+                doc.get("metadata", {}).get("raw", ""),
             ]
         )
         tokenized.append(tokenize(combined))
@@ -41,7 +50,13 @@ def main():
     bm25 = BM25Okapi(corpus)
 
     meta = [
-        {"index": i, "id": d["id"], "title": d["title"], "source": d["source"]}
+        {
+            "index": i,
+            "document_id": d["document_id"],
+            "title": d["title"],
+            "doc_type": d["doc_type"],
+            "source": d["source"]["name"],
+        }
         for i, d in enumerate(documents)
     ]
 
@@ -57,7 +72,7 @@ def main():
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:3]
         print(f"\nquery: {query!r}")
         for i, score in ranked:
-            print(f"  {score:.2f}  {meta[i]['id']}  {meta[i]['title']}")
+            print(f"  {score:.2f}  {meta[i]['document_id']}  {meta[i]['title']}")
 
 
 if __name__ == "__main__":

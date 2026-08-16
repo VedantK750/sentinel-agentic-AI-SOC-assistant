@@ -23,7 +23,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Phase 4 is done.** Retrieval (BM25 + vector + RRF + cross-encoder rerank) is now fully built and measured end to end. **Next up: Phase 5** (intent routing + agent/tool layer) — see "Recommendation" at the bottom.
+**Phase 4 is done, and the Phase 1 schema gap flagged afterward is now closed too.** Retrieval (BM25 + vector + RRF + cross-encoder rerank) is fully built and measured end to end, and every document now carries a consistent `{document_id, doc_type, source, title, content, metadata}` shape with MITRE tactics and Sigma ATT&CK mappings actually extracted (not just sitting in raw text). **Next up: Phase 5** (intent routing + agent/tool layer) — see "Recommendation" at the bottom.
 
 ---
 
@@ -39,9 +39,10 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 - [x] **4.1 MITRE ATT&CK** — `scripts/parse_mitre.py` extracts `attack-pattern` objects from the STIX bundle → 858 docs
 - [~] **4.2 Sigma Rules** — `scripts/parse_sigma.py` clones SigmaHQ and parses rule YAML → 3,137 docs. *Deviation:* plan calls for parsing "with the Sigma ecosystem/pySigma where practical"; current implementation uses plain `yaml.safe_load`, not `pysigma` (which sits unused in requirements.txt). Good enough for indexing text, but no rule validation or backend-target translation.
-- [ ] **4.3 Security Runbooks** — no runbook corpus yet (plan wants ~9 Markdown runbooks: PowerShell investigation, credential dumping, phishing, suspicious login, malware, ransomware, endpoint isolation, malicious IP response, incident escalation)
-- [ ] **4.4 Alert/Event Data** — no synthetic alert/event corpus yet (Sysmon, auth failures, Suricata, etc.)
-- [~] **Document normalization (§5)** — current schema is `{id, title, content, source}`. Plan's canonical schema also wants `doc_type` (e.g. `attack-technique`, `detection-rule`) and a `metadata` object (tactic, sub-technique relationships, source URL, log source, ATT&CK mappings on Sigma rules). Not yet added — will matter once source-filtered retrieval or runbooks/alerts (different `doc_type`s) enter the corpus.
+- [ ] **4.3 Security Runbooks** — no runbook corpus yet (plan wants ~9 Markdown runbooks: PowerShell investigation, credential dumping, phishing, suspicious login, malware, ransomware, endpoint isolation, malicious IP response, incident escalation). Schema is ready to receive a `doc_type: "runbook"` — see ARCHITECTURE.md — but the corpus itself isn't written.
+- [ ] **4.4 Alert/Event Data** — no synthetic alert/event corpus yet (Sysmon, auth failures, Suricata, etc.). Same story: schema-ready (`doc_type: "security_alert"`), corpus not built.
+- [x] **Document normalization (§5)** — every document now has the canonical `{document_id, doc_type, source, title, content, metadata}` shape. MITRE docs carry `technique_id`/`tactics`/`platforms`/`parent_technique_id` in `metadata`; Sigma docs carry `attack_techniques`/`attack_tactics` (parsed out of `tags`, no longer just inert text)/`logsource`/`references`/`raw`. Full rationale in [DECISIONS.md](DECISIONS.md), schema examples in [ARCHITECTURE.md](ARCHITECTURE.md).
+- [x] Schema validation — `scripts/validate_documents.py` checks required fields, `document_id` uniqueness, and that extraction actually worked (measured: 100% of MITRE docs have tactics, 89% of Sigma docs have ATT&CK technique mappings)
 
 ## Phase 2 — Indexing Pipeline *(PLAN §6)*
 
@@ -56,7 +57,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 ## Phase 3 — Retrieval: Dense, Lexical, Hybrid RRF *(PLAN §7, §8, §9)*
 
 - [~] **Dense retrieval (Qdrant)** — `app/retrieval/vector_retriever.py`. *Deviation:* plan specifies `BAAI/bge-small-en-v1.5`; current implementation uses `all-MiniLM-L6-v2` (carried over from the original indexing script). Both are reasonable small sentence-transformer models — worth an explicit decision on which to standardize on rather than leaving it implicit.
-- [ ] Metadata filtering (only-MITRE / only-Sigma / only-runbook search) — not implemented; needs `doc_type` in payload (blocked by Phase 1 schema gap) plus a `filter` param on `VectorRetriever.search`
+- [ ] Metadata filtering (only-MITRE / only-Sigma / only-runbook search) — not implemented yet, but no longer blocked: `doc_type` is now in both the BM25 meta sidecar and the Qdrant payload; just needs a `filter` param added to `BM25Retriever.search`/`VectorRetriever.search`
 - [x] **Lexical retrieval (BM25)** — `app/retrieval/bm25_retriever.py`, returns id/rank/score
 - [x] **Hybrid RRF** — `app/retrieval/fusion.py` + `app/retrieval/hybrid.py`, configurable `k` (default 60), documented in [DECISIONS.md](DECISIONS.md) and [ARCHITECTURE.md](ARCHITECTURE.md)
 - [x] Fused result exposes rank per retriever (plan §9 requirement) — `reciprocal_rank_fusion` now takes a `{name: ranked_list}` dict and returns a `"ranks"` field per doc, e.g. `{"bm25": 2, "vector": 7}`, with entries omitted for retrievers that didn't return the doc. Verified against live queries: `T1059` resolves via BM25 alone (vector's #1 for that query is the false friend `T1065`), giving a concrete "one retriever wins" example for the Phase 4 eval.
@@ -125,9 +126,8 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 
 ## Recommendation: what to do next
 
-Retrieval (Phases 2–4) is now complete and measured — BM25, vector, RRF, and cross-encoder reranking all work and the eval script proves the hybrid+rerank pipeline earns its complexity. Before moving into Phase 5 (intent routing), one deferred item from Phase 1 is worth revisiting now rather than later:
+Retrieval (Phases 2–4) and the document schema (Phase 1's `doc_type`/`metadata` gap) are both done and measured now — nothing structural is left blocking the agentic half of the project. **Move to Phase 5** (intent router): the natural entry point into everything that follows, since Phase 6 onward (generation, groundedness, RBAC, propose-confirm-execute) all depend on knowing whether a request is a read or a write before anything else happens.
 
-1. **Add `doc_type` + `metadata` to the document schema.** Runbooks and alerts (Phase 1, still unbuilt) will be new `doc_type`s; source-filtered retrieval (Phase 3 gap) and citation formatting (Phase 6) both key off it; and the intent router (Phase 5) will likely want to route certain intents ("search runbook") to a `doc_type`-filtered search. Retrofitting this after the agent/tool layer and generation are built means touching the parsers, both indexers, both retrievers, and the eval script all over again.
-2. **Then Phase 5** (intent router) — the natural entry point into the agentic half of the project. Everything from Phase 6 onward (generation, groundedness, RBAC, propose-confirm-execute) depends on knowing whether a request is a read or a write before anything else happens.
-
-Runbooks and alert/event data (the rest of Phase 1) can stay deferred until the schema exists to receive them — no reason to build a corpus for a schema that isn't ready yet.
+Two items remain deliberately deferred, not because they're hard but because nothing downstream needs them yet:
+- **Runbooks and alert/event data** (rest of Phase 1) — the schema is ready to receive both (`doc_type: "runbook"` / `"security_alert"`, documented in ARCHITECTURE.md), but building the actual corpora is only worth doing once something (Phase 5's "search runbook" intent, Phase 11's demo scenario) will actually consume them.
+- **Metadata-filtered retrieval** (Phase 3) — `doc_type` now exists in both indices, so this is a small addition whenever a concrete need for it shows up (e.g. Phase 5 routing a "search runbook" intent to a `doc_type`-filtered query) rather than something to build speculatively now.
