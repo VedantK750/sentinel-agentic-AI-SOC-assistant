@@ -202,7 +202,7 @@ This is the "Read vs Write" branch from PLAN §3's architecture diagram — it d
 
 1. **`IntentRouter`** (`router.py`) classifies a query against a small fixed set of intents (`explain_technique`, `search_detection_rule`, `search_knowledge_base` — read; `block_ip`, `isolate_endpoint` — write), each defined by a handful of example utterances plus optional keyword/regex signals. Scoring combines a semantic signal (max cosine similarity against an intent's example-utterance embeddings, same `all-MiniLM-L6-v2` model retrieval already uses) with a lexical signal (keyword/technique-ID-pattern match), then gates the decision on both an absolute confidence threshold (stricter for write intents) and a minimum margin over the runner-up intent. Below either bar, it returns `clarify` instead of guessing. See [DECISIONS.md](DECISIONS.md) for the full rationale and the specific edge cases this was verified against.
 2. **`ToolRegistry`** (`tools.py`) holds 8 tools matching PLAN §13's initial list, each a `Tool` dataclass declaring `name`, `description`, `category`, `side_effecting`, `idempotent`, `required_permission`, `audit_event`, a pydantic `input_model`, and a `handler`. Two are real (`search_knowledge_base`, `search_sigma_rules` — both call the full RRF+rerank+boost pipeline with an optional/fixed `doc_type` filter); three are honest stubs returning "no data source yet" (`lookup_ioc`, `get_alert`, `get_incident` — blocked on Phase 1/8); three are honest stubs returning `{"status": "not_executed", ...}` (`create_incident`, `block_ip`, `isolate_endpoint` — blocked on Phase 7's RBAC/confirm/execute pipeline).
-3. **`Orchestrator`** (`orchestrator.py`) is the thin glue: classify, then for a confident read intent call the matching tool (an intent and a tool are not the same thing — `explain_technique` and `search_knowledge_base` both end up calling the `search_knowledge_base` tool, just with a different `doc_type`); for a confident write intent, report the classification and stop, since there's nowhere further to hand it off to yet; for `clarify`, return the router's message as-is.
+3. **`Orchestrator`** (`orchestrator.py`) is the thin glue: classify, then for a confident read intent call the matching tool (an intent and a tool are not the same thing — `explain_technique` and `search_knowledge_base` both end up calling the `search_knowledge_base` tool, just with a different `doc_type`) and run its results through `GenerationPipeline` (below) for a cited, verified answer; for a confident write intent, report the classification and stop, since there's nowhere further to hand it off to yet; for `clarify`, return the router's message as-is.
 
 Run it directly:
 ```
@@ -230,12 +230,19 @@ python -m app.generation.groundedness
 python -m app.generation.pipeline
 ```
 
+## Manual testing (`app/cli.py`)
+
+The whole system, one query at a time, end to end (router → tool → retrieval+rerank+boost → generation → groundedness):
+```
+python -m app.cli "your query here"
+```
+This is the fastest way to see all layers work together on an arbitrary query without editing any module's hardcoded example list. It builds one `Orchestrator` per run — first invocation is slow (downloads/loads every model: embedder, reranker, NLI judge), subsequent calls in the same process are fast. Not the API layer — `app/main.py` (Phase 8) will be the FastAPI entrypoint, built around this same `Orchestrator`.
+
 ## Not yet built
 
 These are the natural next layers, not yet implemented:
 
 - **API layer** (`fastapi`/`uvicorn`/`pydantic` are already in `requirements.txt`): a thin HTTP wrapper around `Orchestrator`, likely `app/main.py` + `app/api/chat.py`, holding one instance at process startup.
-- **`Orchestrator` doesn't call `GenerationPipeline` yet**: Phase 5's `Orchestrator` still returns raw tool results for read intents; wiring in `app/generation/` so a read query gets a cited answer instead of a ranked list is the natural next step, not yet done.
 - **`pysigma`** (already in `requirements.txt`, unused so far): intended for translating Sigma detection logic into query-backend-specific queries (e.g. for a "does this rule apply to my SIEM" feature) — not wired into retrieval.
 - **Runbooks and synthetic alerts** (PLAN §4.3/§4.4): the schema is designed to accept them (see "Extending to new doc_types" above) but neither corpus exists yet; `lookup_ioc`/`get_alert`/`get_incident` stay stubs until they do.
 - **RBAC + propose-confirm-execute** (PLAN §17-19, Phase 7): `block_ip`/`isolate_endpoint`/`create_incident` are classified correctly by the router and declare their eventual `required_permission`, but nothing executes them — no authorization check, no confirmation step, no mock firewall/EDR/incident API to call.

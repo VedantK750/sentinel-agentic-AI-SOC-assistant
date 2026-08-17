@@ -1,3 +1,6 @@
+from app.generation.pipeline import GenerationPipeline
+from app.retrieval.documents import load_content_by_id
+
 from .router import IntentRouter
 from .tools import build_default_registry
 
@@ -24,9 +27,16 @@ class Orchestrator:
     somewhere real for it to hand off to.
     """
 
-    def __init__(self, router=None, registry=None):
+    def __init__(self, router=None, registry=None, generation_pipeline=None):
         self.router = router or IntentRouter()
         self.registry = registry or build_default_registry()
+        self.generation_pipeline = generation_pipeline or GenerationPipeline()
+        self._content_by_id = None  # loaded lazily, only if a read intent actually fires
+
+    def _get_content_by_id(self):
+        if self._content_by_id is None:
+            self._content_by_id = load_content_by_id()
+        return self._content_by_id
 
     def handle(self, query):
         result = self.router.classify(query)
@@ -53,12 +63,26 @@ class Orchestrator:
 
         tool_name, extra_kwargs = READ_INTENT_TOOLS[result.intent]
         tool_result = self.registry.call(tool_name, query=query, **extra_kwargs)
+        search_results = tool_result["results"]
+
+        content_by_id = self._get_content_by_id()
+        evidence = [
+            {
+                "document_id": r["document_id"],
+                "title": r["title"],
+                "content": content_by_id.get(r["document_id"], ""),
+            }
+            for r in search_results
+        ]
+        generation_result = self.generation_pipeline.answer(query, evidence)
+
         return {
             "intent": result.intent,
             "category": "read",
             "confidence": result.confidence,
             "tool": tool_name,
-            **tool_result,
+            "retrieved": search_results,
+            **generation_result,
         }
 
 
@@ -78,9 +102,10 @@ def main():
         print(f"  intent={result['intent']}  category={result.get('category')}  confidence={result['confidence']:.2f}")
         if "message" in result:
             print(f"  {result['message']}")
-        if "results" in result:
-            for r in result["results"][:3]:
-                print(f"    {r['document_id']}  {r['title']}")
+        if "claims" in result:
+            print(f"  grounded={result['grounded']}  insufficient_evidence={result['insufficient_evidence']}")
+            for claim in result["claims"]:
+                print(f"    - {claim['text']}  {claim['cited_document_ids']}")
 
 
 if __name__ == "__main__":

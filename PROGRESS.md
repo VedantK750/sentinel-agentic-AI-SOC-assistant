@@ -23,7 +23,7 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Phase 6 is done.** Generation (structured, citation-grounded claims) and a post-generation groundedness judge (NLI-based, with a regen-or-reject fallback) are both built, wired together in `app/generation/pipeline.py`, and verified end to end against real queries covering all three required behaviors: regenerate-and-succeed, partial-fallback, and correct-decline-on-no-evidence. Two real engineering findings along the way — a reasoning-model `max_tokens` gotcha on the LLM endpoint, and a wrong-for-this-task NLI checkpoint caught by testing against a known-correct example — are both in [DECISIONS.md](DECISIONS.md). **Next up: wire `GenerationPipeline` into `Orchestrator`** so read intents return a cited answer instead of a raw result list, then Phase 7 (RBAC) — see "Recommendation" at the bottom.
+**Phase 6 is done, and `GenerationPipeline` is now wired into `Orchestrator`** — a confident read query returns a cited, groundedness-checked answer end to end, not a raw result list, closing the loop on PLAN §3's full Read pipeline. `app/cli.py` (`python -m app.cli "your query"`) is a manual-testing entry point for the whole system, one query at a time. Two real engineering findings along the way — a reasoning-model `max_tokens` gotcha on the LLM endpoint, and a wrong-for-this-task NLI checkpoint caught by testing against a known-correct example — are both in [DECISIONS.md](DECISIONS.md). **Next up: Phase 7** (RBAC + propose-confirm-execute) — see "Recommendation" at the bottom.
 
 ---
 
@@ -139,7 +139,7 @@ Full writeups of both in [DECISIONS.md](DECISIONS.md).
 
 ## Recommendation: what to do next
 
-Retrieval (Phases 2-4), the document schema, the intent router + tool layer (Phase 5), and generation + groundedness (Phase 6) are all done and verified now. **Wire `GenerationPipeline` into `Orchestrator`** first — small, high-value, closes the loop on what already exists: right now a confident read intent returns a raw ranked result list; routing it through generation instead means the system answers with cited, verified claims end to end, exactly PLAN §3's Read pipeline. After that, **Phase 7** (RBAC + propose-confirm-execute) is the next real phase — `block_ip`/`isolate_endpoint`/`create_incident` are already classified correctly and declare their required permissions; nothing enforces or executes them yet.
+Retrieval (Phases 2-4), the document schema, the intent router + tool layer (Phase 5), and generation + groundedness (Phase 6) are all done, wired together end to end, and verified now — a confident read query returns cited, groundedness-checked claims, not a raw result list. **Phase 7** (RBAC + propose-confirm-execute) is the next real phase — `block_ip`/`isolate_endpoint`/`create_incident` are already classified correctly and declare their required permissions; nothing enforces or executes them yet.
 
 Deliberately still deferred, not because they're hard but because nothing downstream needs them yet:
 - **Runbooks and alert/event data** (rest of Phase 1) — schema-ready, corpus not built; worth doing once a `search_runbook`/`investigate_alert` intent actually needs something to search.
