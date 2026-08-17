@@ -22,6 +22,7 @@ class GenerationPipeline:
         verdict = None
 
         for attempt in range(1, MAX_RETRIES + 2):
+            print(f"[pipeline] generation attempt {attempt}/{MAX_RETRIES + 1}...")
             generated = self.generator.generate(query, documents, failed_claims=failed_claims)
             if generated is None:
                 continue  # unparseable response -- retry blind, nothing to point at
@@ -36,6 +37,7 @@ class GenerationPipeline:
                     "attempts": attempt,
                 }
 
+            print(f"[pipeline] verifying {len(generated.claims)} claim(s) against evidence...")
             verdict = self.judge.verify(generated)
             if verdict["grounded"]:
                 return {

@@ -4,6 +4,40 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-18 — LLM call had no timeout, no error handling, and no progress visibility
+
+**What happened:** the user asked, mid-run, why a query was taking minutes. Investigated the live process rather than guessing: `ps` showed it still at 70%+ CPU after 3.5 minutes (actively working, not hung), with two open HTTPS connections — one to Hugging Face's CDN, one to a Cloudflare-fronted host (the LLM endpoint, no reverse DNS). It eventually crashed the whole CLI with an unhandled `openai.InternalServerError` traceback.
+
+**Three real gaps, not one:**
+1. **No client-side timeout.** `Generator`'s `OpenAI` client had no `timeout` set, so a single slow or wedged HTTP call could block the entire pipeline indefinitely with nothing to show for it.
+2. **No error handling around the LLM call.** `generate()` only ever caught JSON-parse failures — an actual API/network error (5xx, timeout, connection drop) propagated all the way up through `GenerationPipeline` and `Orchestrator` and crashed `app.cli` with a raw traceback, instead of being treated as a generation failure the same way an unparseable response already was.
+3. **Zero progress output between stages.** Nothing printed between "loading models" and a final result, so a slow run gave no signal about which stage was actually active — the user had no way to distinguish "still thinking" from "hung" from "about to crash" without me manually inspecting OS-level process state (`ps`, open sockets) to answer the question at all.
+
+**Also found while diagnosing: the machine itself was under heavy memory pressure** (1.4GB free of 14GB RAM, 7.2GB swapped) — independent of any code issue, this alone would slow down loading the 4 separate transformer models a fresh `app.cli` process constructs (router's embedder, groundedness judge's NLI model, retrieval's own embedder instance, the reranker). Worth knowing as a real, non-code contributor to run-to-run latency variance, not something the code can fix.
+
+**Compounding risk from the previous fix:** the `max_tokens` retry added earlier in this session (to fix truncation) stacks with `GenerationPipeline`'s own regen-or-reject retry — worst case, up to 6 sequential LLM calls before returning anything, each potentially slow against a reasoning model. Noting this honestly: fixing one failure mode (truncation) without considering how it interacts with an existing retry layer can make the worst case *slower*, not just "eventually correct." Not restructured further here (no evidence yet that 6 is actually reached in practice, versus 1-2 in the observed cases) — flagged for the next time this surfaces.
+
+**Fixes:**
+- `Generator.__init__` now passes `timeout=90.0` to the `OpenAI` client — generous relative to every successful call observed so far, but bounded.
+- `Generator.generate()` catches `openai.OpenAIError` (the SDK's base exception, covering timeouts, connection errors, and API status errors like the 500 that actually occurred) and returns `None`, the same contract already used for unparseable responses — `GenerationPipeline`'s existing retry handles a second attempt, nothing crashes.
+- Added `print()` progress markers at each real stage boundary (`Orchestrator`: classifying, retrieving; `GenerationPipeline`: which generation attempt, verifying N claims; `Generator`: calling the LLM, at what token budget) — cheap, not a logging framework, but enough that "why is this slow" is answerable by reading the terminal instead of inspecting process state.
+
+---
+
+## 2026-08-18 — Router restructured into a real cascade: broad fallback, not just per-intent thresholds
+
+**What happened:** the user's next manual test (`"How to do sudo privilidge escalation on Linux?"`) hit the exact same failure *class* as the WiFi query, one commit after that one was "fixed." The corpus had excellent, directly relevant content (`T1548.003` "Sudo and Sudo Caching", `T1169` "Sudo", `T1068` "Exploitation for Privilege Escalation") — this was a router problem, not a retrieval or generation problem. Ruled out the typo first (`"privilidge"` vs `"privilege"`) by testing both spellings: the *correctly spelled* version scored **lower**, not higher, across every intent — not the cause.
+
+**Recognizing the pattern, not just patching it again:** two vocabulary-gap bugs on the same intent (`search_knowledge_base`) in a row is a signal, not a coincidence. Adding examples one topic at a time (as done for the WiFi case) doesn't scale — `explain_technique` and `search_knowledge_base` are meant to cover an open-ended topic space (any of ~4,000 documents, spanning the entire ATT&CK matrix and Sigma ruleset) using a handful of hand-picked example utterances. `search_detection_rule`/`block_ip`/`isolate_endpoint` don't have this problem because they're about *query form* (a detection question, a block command), which a few examples generalize well; `search_knowledge_base` is about *topic*, which a few examples fundamentally cannot cover.
+
+**Diagnosed before designing a fix, not the other way around:** pulled `search_knowledge_base`'s own score in isolation across two groups of queries — genuinely off-topic (`"hey"`, weather, pizza, bare `"search"`) and legitimate-but-uncovered security questions (sudo privilege escalation, DLL sideloading, container escape). Off-topic topped out at **0.184**; legitimate-but-uncovered started at **0.204**. A real, exploitable gap — but before trusting a threshold picked between those two numbers, tested it against the two already-validated edge cases specifically likely to break: `"block"` alone scored **0.184** against `search_knowledge_base` — right at the boundary, and dangerous, because `"block"` is a case the router is *supposed* to refuse (PLAN §18 fail-closed). A naive "lower `search_knowledge_base`'s threshold" fix would have silently turned a correctly-refused ambiguous write query into a read search.
+
+**Fix — two guards, not one:** `IntentRouter.classify()` is now closer to PLAN §12's actual described cascade rather than a single flat threshold check. If the top-scoring intent clears its own threshold + margin as before, unchanged. If not, `search_knowledge_base` gets a second chance at a **lower bar (0.20)** — but only when the *top-scoring intent's category was already `read`*. `"block"` alone never reaches this fallback at all, because its top-scoring intent is `block_ip` (write) — the category guard, not the threshold number, is what actually protects it; the 0.20 value has headroom on both sides (above `"block"`'s 0.184, below the legitimate cases' 0.204+) but isn't the sole safety mechanism.
+
+**Verified, not assumed:** re-ran every previously-validated router test case (all of Phase 5's edge cases plus the WiFi fix) after this change — zero regressions, including `"block"` alone still correctly clarifying and `"What sigma rule covers T1003"` still correctly clarifying on its genuine margin-tie (its `search_knowledge_base` score is -0.011, nowhere near the fallback bar, so the new logic doesn't touch that case at all). Both the sudo-privilege-escalation and WiFi queries now resolve to `search_knowledge_base` through the fallback path — and two more never-explicitly-fixed queries (`"Explain container escape techniques"`, `"What is DLL sideloading"`) now correctly resolve too, which the earlier per-example patch for WiFi specifically would *not* have caught. That's the actual evidence the structural fix was the right call over another one-off patch.
+
+---
+
 ## 2026-08-18 — Two bugs found and fixed through the user's own manual testing
 
 Both surfaced from a single real query the user tried: `"How to do WIFI hacking on windows?"`. Neither was something the existing eval set or demo queries would have caught — a concrete argument for why manual exploration matters even after automated checks pass.

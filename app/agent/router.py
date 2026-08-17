@@ -24,6 +24,20 @@ WRITE_CONFIDENCE_THRESHOLD = 0.55
 # well on a borderline query.
 MARGIN_THRESHOLD = 0.05
 
+# search_knowledge_base is the deliberate broad catch-all -- PLAN §12's cascade ends
+# in "escalate/clarify when uncertain", but a fallback that's held to the same bar as
+# the narrow, specific intents can never actually play that role: it's matching
+# against open-ended topic space (any of ~4,000 documents) with only a handful of
+# examples, so even a genuine true positive scores lower than a specific intent's true
+# positive would. Verified empirically before picking this number, not guessed: on a
+# spread of clearly off-topic queries ("hey", weather, pizza, bare "search"), its own
+# score topped out at 0.184; on legitimate security questions using vocabulary none of
+# its examples cover ("sudo privilege escalation", "DLL sideloading"), it started at
+# 0.204. See DECISIONS.md for the full readout and why "block" specifically (0.184,
+# right at that boundary) needed the second guard below, not just this number.
+FALLBACK_INTENT = "search_knowledge_base"
+FALLBACK_CONFIDENCE_THRESHOLD = 0.20
+
 # Additive nudge applied when a lexical/keyword signal fires for an intent, on
 # top of its semantic similarity score. Mirrors why retrieval combines BM25 with
 # vector search: a generic sentence embedding can blur "block that IP" and
@@ -152,24 +166,40 @@ class IntentRouter:
         margin = top_score - runner_up_score
 
         threshold = WRITE_CONFIDENCE_THRESHOLD if top_intent.category == WRITE else READ_CONFIDENCE_THRESHOLD
-        if top_score < threshold or margin < MARGIN_THRESHOLD:
+        if top_score >= threshold and margin >= MARGIN_THRESHOLD:
             return IntentResult(
-                intent="clarify",
-                category=None,
+                intent=top_intent.name,
+                category=top_intent.category,
                 confidence=top_score,
-                message=(
-                    f"Not confident enough to route this (best candidate "
-                    f"'{top_intent.name}' scored {top_score:.2f} vs threshold "
-                    f"{threshold:.2f}, margin over runner-up {margin:.2f} vs "
-                    f"required {MARGIN_THRESHOLD:.2f}). Please rephrase or be "
-                    "more specific."
-                ),
             )
 
+        # Nothing cleared its own bar with a clear margin. Before giving up, check
+        # whether the broad catch-all applies on its own, lower bar -- but only when
+        # the strongest signal was already leaning read. If the strongest (if
+        # unconfirmed) signal was a write intent -- e.g. bare "block", which scores
+        # 0.54 on block_ip and never even reaches this fallback's own threshold
+        # question -- silently reclassifying it as a read search would paper over a
+        # write-flavored ambiguity instead of surfacing it. See DECISIONS.md.
+        if top_intent.category == READ:
+            fallback_score = next(score for intent, score, _, _ in scored if intent.name == FALLBACK_INTENT)
+            if fallback_score >= FALLBACK_CONFIDENCE_THRESHOLD:
+                return IntentResult(
+                    intent=FALLBACK_INTENT,
+                    category=READ,
+                    confidence=fallback_score,
+                )
+
         return IntentResult(
-            intent=top_intent.name,
-            category=top_intent.category,
+            intent="clarify",
+            category=None,
             confidence=top_score,
+            message=(
+                f"Not confident enough to route this (best candidate "
+                f"'{top_intent.name}' scored {top_score:.2f} vs threshold "
+                f"{threshold:.2f}, margin over runner-up {margin:.2f} vs "
+                f"required {MARGIN_THRESHOLD:.2f}). Please rephrase or be "
+                "more specific."
+            ),
         )
 
     @staticmethod

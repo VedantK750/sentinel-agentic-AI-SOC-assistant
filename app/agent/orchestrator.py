@@ -39,6 +39,7 @@ class Orchestrator:
         return self._content_by_id
 
     def handle(self, query):
+        print("[orchestrator] classifying intent...")
         result = self.router.classify(query)
 
         if result.intent == "clarify":
@@ -62,6 +63,7 @@ class Orchestrator:
             }
 
         tool_name, extra_kwargs = READ_INTENT_TOOLS[result.intent]
+        print(f"[orchestrator] intent={result.intent} (confidence {result.confidence:.2f}) -> retrieving via {tool_name}...")
         tool_result = self.registry.call(tool_name, query=query, **extra_kwargs)
         search_results = tool_result["results"]
 
@@ -74,6 +76,7 @@ class Orchestrator:
             }
             for r in search_results
         ]
+        print(f"[orchestrator] retrieved {len(evidence)} document(s) -> starting generation...")
         generation_result = self.generation_pipeline.answer(query, evidence)
 
         return {

@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from pydantic import BaseModel
 
 from .prompts import SYSTEM_PROMPT, build_user_prompt
@@ -28,6 +28,14 @@ DEFAULT_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash")
 INITIAL_MAX_TOKENS = 2048
 MAX_TOKENS_RETRIES = 2  # 2048 -> 4096 -> 8192
 
+# Found the hard way: a query that makes the model reason unusually long can leave a
+# single HTTP call to this endpoint hanging for minutes with no error and no visible
+# progress -- confirmed by watching a real request sit at 70%+ CPU for 3.5 minutes
+# before the endpoint itself returned a 500. Without a client-side timeout, a single
+# slow or wedged call blocks the whole pipeline indefinitely with nothing to show for
+# it. 90s is generous relative to every successful call observed so far, but bounded.
+REQUEST_TIMEOUT = 90.0
+
 
 class Claim(BaseModel):
     text: str
@@ -48,17 +56,21 @@ class Generator:
     max_tokens and why response_format is used instead of a stricter schema mode.
     """
 
-    def __init__(self, model=DEFAULT_MODEL):
+    def __init__(self, model=DEFAULT_MODEL, timeout=REQUEST_TIMEOUT):
         self.client = OpenAI(
             api_key=os.environ["LLM_API_KEY"],
             base_url=os.environ["LLM_ENDPOINT"],
+            timeout=timeout,
         )
         self.model = model
 
     def generate(self, query, documents, failed_claims=None) -> Optional[GeneratedAnswer]:
-        """Returns None if the model's response isn't valid JSON matching the schema
-        even after expanding the token budget -- callers should treat that the same
-        as "insufficient evidence", not crash.
+        """Returns None if the call fails outright (timeout, network, endpoint error)
+        or the response isn't valid JSON matching the schema even after expanding the
+        token budget -- callers should treat all of these as "insufficient evidence",
+        not crash. GenerationPipeline's own regen-or-reject retry is what gets a
+        second attempt; this method doesn't retry API errors itself since the SDK
+        client already retries transient ones internally before ever raising here.
         """
         user_prompt = build_user_prompt(query, documents, failed_claims=failed_claims)
         messages = [
@@ -68,12 +80,18 @@ class Generator:
 
         max_tokens = INITIAL_MAX_TOKENS
         for attempt in range(MAX_TOKENS_RETRIES + 1):
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                max_tokens=max_tokens,
-            )
+            print(f"  [generator] calling LLM (max_tokens={max_tokens})...")
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                )
+            except OpenAIError as e:
+                print(f"  [generator] LLM call failed ({e!r}); treating as insufficient evidence")
+                return None
+
             choice = response.choices[0]
             if choice.finish_reason == "length" and attempt < MAX_TOKENS_RETRIES:
                 max_tokens *= 2
