@@ -4,6 +4,32 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-18 — Swapped groundedness judge model after a 5-candidate benchmark, targeting phrasing sensitivity specifically
+
+**What happened:** the user asked directly what to fix to make the generation pipeline "a 10/10" and, correctly guessing the NLI judge was the weak point (given the `doas` 0.851-vs-0.125 phrasing-swing bug found the previous session), asked for a real benchmark against alternatives before committing to a swap — not a guess.
+
+**Method, not vibes:** built a labeled 18-case test set from real corpus content (`data/documents.json`, not synthetic sentences) spanning 4 categories a groundedness judge must get right: `supported` (3 independent phrasings each of 3 true facts — T1059, T1195, the mimikatz Sigma rule — specifically to reproduce the phrasing-sensitivity bug), `misattributed` (true statements, wrong citation — e.g. a claim about T1195.001's pip/NPM content attributed to parent T1195), `hallucinated` (fabricated facts), and `overreach` (plausible-sounding inferences the text doesn't actually state). A well-functioning judge accepts only `supported`. For each candidate, the entailment label index was found empirically via `model.config.id2label` (never assumed — the two prior models used in this project had different label orders) rather than hardcoded.
+
+**Candidates tested (chosen for either a larger backbone, or training data specifically aimed at paraphrase/lexical-shortcut robustness) and results:**
+
+| model | accuracy | mean phrasing spread (lower=better) |
+|---|---|---|
+| `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` (prior default) | 100% (18/18) | 0.136 |
+| **`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`** | **100% (18/18)** | **0.001** |
+| `MoritzLaurer/DeBERTa-v3-base-mnli-fever-docnli-ling-2c` | FAILED to load — `ValueError: Unrecognized processing class`. This checkpoint's tokenizer needs a SentencePiece extraction path not available in this environment (`sentencepiece` library absent, TikToken fallback also failed). A real environment-compatibility finding, excluded rather than forced. |
+| `cross-encoder/nli-deberta-v3-large` | 89% (16/18) | 0.331 |
+| `sileod/deberta-v3-base-tasksource-nli` | 100% (18/18) | 0.087 |
+
+**`cross-encoder/nli-deberta-v3-large` reproduced the exact production bug and got worse, not better, from more parameters:** the T1059 phrasing group scored `[0.070, 0.981, 0.014]` — two of three genuinely-true rewordings misclassified as unsupported (spread 0.967, the single worst result across every candidate). Confirms scale alone doesn't fix phrasing sensitivity; it's a training-data property, not a capacity one.
+
+**`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli` won decisively, confirming the hypothesis behind why it was included:** its training data adds WANLI (Worker-AI collaborated NLI), built specifically to remove superficial lexical-overlap shortcuts from the training signal. Every phrasing group scored in a tight 0.997–1.000 band regardless of wording — a **136x reduction** in phrasing spread versus the prior default, at identical (100%) accuracy. `sileod/deberta-v3-base-tasksource-nli` (broad 600-task multi-task NLI) was a reasonable second place but not competitive with this margin.
+
+**Decision:** `groundedness.py`'s `MODEL_NAME` is now `MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`. `ENTAILMENT_INDEX` re-verified empirically for this specific checkpoint (`{0: 'entailment', 1: 'neutral', 2: 'contradiction'}` — happens to still be index 0, confirmed rather than assumed).
+
+**Verified end to end, not just on the benchmark set:** re-ran the exact mimikatz query that previously exhibited the 7→3 claim-drop bug (`"What is mimikatz and how does the detection rule for it work?"`). Result: **all 7 generated claims verified as grounded on the first attempt** — zero retries needed, where previously 4 of 7 failed the judge on wording alone and had to be recovered via the claim-accumulation fix. Also re-ran `"What is T1059?"` (single claim, grounded first attempt, exact-match retrieval intact) to confirm no regression on the simple case.
+
+---
+
 ## 2026-08-18 — GenerationPipeline was silently discarding already-verified claims on retry
 
 **What happened:** the user asked why a real run went from "verifying 7 claim(s)" on attempt 1 down to "verifying 3 claim(s)" on attempt 2, and asked for a rating of the delivered answer. Reproduced the exact scenario with per-claim entailment scores visible (not just pass/fail) rather than guessing.

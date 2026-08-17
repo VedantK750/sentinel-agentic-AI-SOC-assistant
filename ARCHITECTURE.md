@@ -19,7 +19,9 @@ sentinel-ai/
 │   ├── index_bm25.py
 │   ├── index_qdrant.py
 │   ├── validate_documents.py    # schema + extraction-coverage checks
-│   └── evaluate_retrieval.py    # BM25 vs vector vs RRF vs RRF+rerank vs RRF+rerank+boost
+│   ├── evaluate_retrieval.py    # BM25 vs vector vs RRF vs RRF+rerank vs RRF+rerank+boost
+│   ├── evaluate_groundedness.py # benchmarks candidate NLI judge models on a labeled claim set
+│   └── groundedness_eval_data.py # labeled (evidence, claim, expected_entailed) cases for the above
 └── app/                         # online, long-lived query path
     ├── retrieval/
     │   ├── documents.py         # load_documents()/load_content_by_id() -- single source of truth
@@ -218,7 +220,7 @@ python -m app.agent.orchestrator
 Turns a read tool's ranked results into an actual cited answer (PLAN §14/§15), then verifies it before returning it (PLAN §16) — the last two boxes in PLAN §3's Read pipeline.
 
 1. **`Generator`** (`generator.py`) calls an LLM (see "LLM provider" below) with the query and the full text of the retrieved evidence documents, using structured output (`response_format: json_object` + Pydantic validation) to get back a `GeneratedAnswer`: a list of `Claim`s, each `{text, cited_document_ids}`, plus an `insufficient_evidence` flag — not free-text the caller has to parse. This structure is what makes the next step possible without a fragile sentence-splitting pass.
-2. **`GroundednessJudge`** (`groundedness.py`) checks each claim individually against *only the document(s) it cites* using an NLI cross-encoder (`MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, loaded once via `sentence-transformers.CrossEncoder` — same pattern as the reranker) — premise = cited document's content, hypothesis = the claim text, checked for entailment probability above a threshold. Catches three distinct failure modes: hallucination (no support anywhere), misattribution (a real, relevant citation that doesn't actually say the specific thing claimed), and a fabricated `document_id` (empty evidence text, always fails). An answer is `grounded` only if **every** claim passes — see [DECISIONS.md](DECISIONS.md) for why this specific NLI checkpoint, not the first one tried.
+2. **`GroundednessJudge`** (`groundedness.py`) checks each claim individually against *only the document(s) it cites* using an NLI cross-encoder (`MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli`, loaded once via `sentence-transformers.CrossEncoder` — same pattern as the reranker) — premise = cited document's content, hypothesis = the claim text, checked for entailment probability above a threshold. Catches three distinct failure modes: hallucination (no support anywhere), misattribution (a real, relevant citation that doesn't actually say the specific thing claimed), and a fabricated `document_id` (empty evidence text, always fails). An answer is `grounded` only if **every** claim passes — see [DECISIONS.md](DECISIONS.md) for the 5-candidate benchmark (`scripts/evaluate_groundedness.py`) behind this specific checkpoint, and why two earlier ones were rejected.
 3. **`GenerationPipeline`** (`pipeline.py`) ties them together with the regen-or-reject path: generate → verify → if ungrounded, retry once naming exactly which claims failed → if still ungrounded, return only the claims that verified, with an explicit "insufficient evidence" note. A `GeneratedAnswer` with zero claims (the model correctly declining) short-circuits as an immediate success — there's nothing to retry.
 
 **LLM provider:** not the Anthropic API — the user supplied their own OpenAI-compatible endpoint via a local `.env` (`LLM_API_KEY`, `LLM_ENDPOINT`, `LLM_MODEL`, loaded with `python-dotenv`; `.env` is gitignored). `generator.py` uses the `openai` Python SDK pointed at that `base_url`. Model is currently `meta-llama/llama-3.1-8b-instruct` — deliberately non-thinking, switched from an initial reasoning-model choice (`deepseek/deepseek-v4-flash`) whose hidden reasoning tokens, billed against the same `max_tokens` as the visible answer, caused real truncation and latency problems (see [DECISIONS.md](DECISIONS.md) for both the original gotcha and the switch). The retry-on-truncation and timeout/error-handling logic in `Generator` were kept regardless — they're general defensive measures, not specific to reasoning models.
@@ -228,6 +230,7 @@ Run it directly:
 python -m app.generation.generator
 python -m app.generation.groundedness
 python -m app.generation.pipeline
+python -m scripts.evaluate_groundedness  # benchmarks NLI judge candidates, see DECISIONS.md
 ```
 
 ## Manual testing (`app/cli.py`)

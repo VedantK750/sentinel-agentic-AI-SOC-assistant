@@ -3,17 +3,18 @@ from sentence_transformers import CrossEncoder
 
 from app.retrieval.documents import DOCS_PATH, load_content_by_id
 
-MODEL_NAME = "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"
+MODEL_NAME = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
 
 # This model's output is 3 logits over (entailment, neutral, contradiction) -- verified
 # empirically, not assumed, via model.config.id2label and known entailed/contradicted/
-# neutral pairs, since a wrong index silently inverts every verdict. Also verified
-# empirically that this checkpoint specifically (trained on FEVER -- claim-vs-evidence
-# fact verification, not just short generic sentence pairs like plain SNLI/MNLI
-# checkpoints) is the one that actually works for long-document-premise vs short-claim
-# entailment: a first attempt with cross-encoder/nli-deberta-v3-base scored an
-# obviously-true, near-verbatim claim at entailment probability 0.003 -- unusable.
-# See DECISIONS.md.
+# neutral pairs, since a wrong index silently inverts every verdict. Chosen over the
+# earlier base-size FEVER checkpoint after a 5-candidate benchmark (18 labeled
+# evidence/claim pairs, incl. 3 independent phrasings of the same fact per example)
+# surfaced a real production bug: the same true claim, reworded, scored 0.851 vs 0.125
+# with the old model -- a coin flip dressed up as a confidence score. This checkpoint's
+# extra WANLI training data (built specifically to punish superficial lexical-overlap
+# shortcuts) cut that phrasing-sensitivity to a mean spread of 0.001 across rewordings,
+# a ~136x improvement, at 100% accuracy on the same labeled set. See DECISIONS.md.
 ENTAILMENT_INDEX = 0
 
 # A claim counts as supported only if the evidence more-likely-than-not entails it --
