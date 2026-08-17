@@ -16,14 +16,14 @@ Phases derived from [PLAN.md](PLAN.md), ordered by build dependency (roughly the
 | 3 | Retrieval — Dense, Lexical, Hybrid RRF | `[x]` done |
 | 4 | Reranking & Retrieval Evaluation | `[x]` done |
 | 5 | Intent Routing & Agent/Tool Layer | `[x]` done (initial slice) |
-| 6 | Generation & Groundedness | `[ ]` not started |
+| 6 | Generation & Groundedness | `[x]` done (initial slice) |
 | 7 | RBAC, Guardrails, Propose→Confirm→Execute | `[ ]` not started |
 | 8 | Persistence, Audit, API Layer | `[ ]` not started |
 | 9 | Frontend & Observability | `[ ]` not started |
 | 10 | Testing, CI/CD, Deployment, Hardening | `[ ]` not started |
 | 11 | Final Demo Scenario | `[ ]` not started |
 
-**Phase 5 is done.** Retrieval (Phases 2-4), the document schema refactor, metadata-filtered retrieval (closing the last Phase 3 gap), and now the intent router + tool layer are all built, wired together, and verified end to end via `app/agent/orchestrator.py`. Building the router's first natural-language query also surfaced and fixed a real latent bug in BM25 tokenization (see [DECISIONS.md](DECISIONS.md)) that had been silently present since Phase 2. **Next up: Phase 6** (generation + groundedness) — see "Recommendation" at the bottom.
+**Phase 6 is done.** Generation (structured, citation-grounded claims) and a post-generation groundedness judge (NLI-based, with a regen-or-reject fallback) are both built, wired together in `app/generation/pipeline.py`, and verified end to end against real queries covering all three required behaviors: regenerate-and-succeed, partial-fallback, and correct-decline-on-no-evidence. Two real engineering findings along the way — a reasoning-model `max_tokens` gotcha on the LLM endpoint, and a wrong-for-this-task NLI checkpoint caught by testing against a known-correct example — are both in [DECISIONS.md](DECISIONS.md). **Next up: wire `GenerationPipeline` into `Orchestrator`** so read intents return a cited answer instead of a raw result list, then Phase 7 (RBAC) — see "Recommendation" at the bottom.
 
 ---
 
@@ -89,13 +89,17 @@ Full writeups of both in [DECISIONS.md](DECISIONS.md).
 
 **Scope boundary, explicit:** the router classifies intent; it does not extract structured arguments (target IP, hostname) from write queries. For write intents, `Orchestrator` reports the classification and stops — there's no RBAC/confirm/execute pipeline (Phase 7) to hand off to yet, so building slot-filling now would be building for a stage that doesn't exist.
 
-## Phase 6 — Read Workflows: Generation & Groundedness *(PLAN §14, §15, §16)*
+## Phase 6 — Read Workflows: Generation & Groundedness *(PLAN §14, §15, §16)* — DONE (initial slice)
 
-- [ ] LLM generation constrained to retrieved evidence only
-- [ ] Citation format (`[T1059] MITRE ATT&CK`, `[Sigma: <rule-id>] ...`)
-- [ ] "Insufficient evidence" fallback response
-- [ ] Groundedness judge (post-generation check that claims are supported)
-- [ ] Regenerate-or-reject path when ungrounded
+- [x] LLM generation constrained to retrieved evidence only — `app/generation/generator.py`, `Generator.generate(query, documents)`. Structured output (Pydantic `GeneratedAnswer`: a list of `{text, cited_document_ids}` claims + `insufficient_evidence`), not free-text — verified the model correctly attributes each claim to the right document rather than mixing sources.
+- [~] Citation format (`[T1059] MITRE ATT&CK`, `[Sigma: <rule-id>] ...`) — the *substance* is there (`cited_document_ids` on every claim, resolvable back to `document_id`/`source`), but literal display-string formatting per PLAN's example isn't built yet; trivial once the API/UI layer exists to need it.
+- [x] "Insufficient evidence" fallback response — `insufficient_evidence` flag on `GeneratedAnswer`, verified with an off-topic query (`"What is the airspeed of a swallow?"`) that correctly returned zero fabricated claims on the first attempt.
+- [x] Groundedness judge (post-generation check that claims are supported) — `app/generation/groundedness.py`, `GroundednessJudge`. NLI cross-encoder (`MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`), checks each claim only against the document(s) it cites, catching hallucination, misattribution, and fabricated citations as three distinct verified cases. **Model swapped mid-build** after the first-choice checkpoint scored an obviously-true claim at 0.003 entailment — see [DECISIONS.md](DECISIONS.md) for the full diagnosis and fix.
+- [x] Regenerate-or-reject path when ungrounded — `app/generation/pipeline.py`, `GenerationPipeline`. One retry naming the specific failed claims; if still ungrounded, falls back to only the claims that verified, with an explicit message — never silently returns an unverified answer.
+
+**Verified end to end**, all three of PLAN §16's required behaviors in one test run: `"How do I detect mimikatz?"` — ungrounded on attempt 1, retried, fully grounded on attempt 2 (the regen path). `"What is T1059?"` — some claims verified and some didn't after retry; the ones that didn't were dropped, not kept (the partial-fallback path). `"What is the airspeed of a swallow?"` — zero claims, `insufficient_evidence=true`, on the *first* attempt — no fabrication, no wasted retry.
+
+**LLM provider is not Anthropic** — the user supplied a third-party OpenAI-compatible endpoint (`deepseek/deepseek-v4-flash`) via `.env`. Caught and fixed a real risk along the way: `.env` existed in the repo but wasn't gitignored before this — added to `.gitignore` before anything could be committed. Full rationale in [DECISIONS.md](DECISIONS.md).
 
 ## Phase 7 — RBAC, Guardrails, Propose→Confirm→Execute *(PLAN §17–§21)*
 
@@ -135,9 +139,10 @@ Full writeups of both in [DECISIONS.md](DECISIONS.md).
 
 ## Recommendation: what to do next
 
-Retrieval (Phases 2-4), the document schema, and the intent router + tool layer (Phase 5) are all done and verified now. **Move to Phase 6** (generation + groundedness): the router already routes a confident read query to a tool that returns ranked evidence — the missing piece is turning that evidence into an actual cited answer instead of a raw result list, which is what `Orchestrator`'s output is standing in for right now.
+Retrieval (Phases 2-4), the document schema, the intent router + tool layer (Phase 5), and generation + groundedness (Phase 6) are all done and verified now. **Wire `GenerationPipeline` into `Orchestrator`** first — small, high-value, closes the loop on what already exists: right now a confident read intent returns a raw ranked result list; routing it through generation instead means the system answers with cited, verified claims end to end, exactly PLAN §3's Read pipeline. After that, **Phase 7** (RBAC + propose-confirm-execute) is the next real phase — `block_ip`/`isolate_endpoint`/`create_incident` are already classified correctly and declare their required permissions; nothing enforces or executes them yet.
 
 Deliberately still deferred, not because they're hard but because nothing downstream needs them yet:
 - **Runbooks and alert/event data** (rest of Phase 1) — schema-ready, corpus not built; worth doing once a `search_runbook`/`investigate_alert` intent actually needs something to search.
 - **Entity/slot extraction for write intents** (surfaced explicitly in Phase 5) — needed before Phase 7's propose-confirm-execute can do anything with a classified write intent, but building it before Phase 7 exists means building for a pipeline stage with nothing to hand off to.
 - **RRF `k` retuning for natural-language exact-ID queries** (surfaced while fixing the BM25 bug, see DECISIONS.md) — a characterized, not fixed, limitation. Worth a dedicated pass through the eval script if it matters enough, not a side effect of unrelated work.
+- **Citation display formatting** (Phase 6 gap) — the structured `cited_document_ids` data is there; rendering it as PLAN's `[T1059] MITRE ATT&CK` string format is cosmetic and belongs with whatever surface (API/UI) first needs to display it.

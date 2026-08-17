@@ -1,6 +1,6 @@
 # Architecture
 
-sentinel-ai is a hybrid-search RAG system over two security knowledge sources today: **MITRE ATT&CK** (techniques) and **SigmaHQ** (detection rules), with the document schema designed to grow to runbooks and security alerts. This doc describes what exists today: an offline ingestion/indexing pipeline, an online hybrid retrieval + reranking path, a retrieval eval harness, and an intent router + tool layer that routes natural-language queries to the right retrieval call (or, for write intents, reports that it can't execute yet). There is no LLM generation, RBAC, or API layer yet — see "Not yet built."
+sentinel-ai is a hybrid-search RAG system over two security knowledge sources today: **MITRE ATT&CK** (techniques) and **SigmaHQ** (detection rules), with the document schema designed to grow to runbooks and security alerts. This doc describes what exists today: an offline ingestion/indexing pipeline, an online hybrid retrieval + reranking path, a retrieval eval harness, an intent router + tool layer, and citation-grounded generation with a post-generation groundedness judge. There is no RBAC or API layer yet — see "Not yet built."
 
 ## Directory layout
 
@@ -22,16 +22,22 @@ sentinel-ai/
 │   └── evaluate_retrieval.py    # BM25 vs vector vs RRF vs RRF+rerank vs RRF+rerank+boost
 └── app/                         # online, long-lived query path
     ├── retrieval/
+    │   ├── documents.py         # load_documents()/load_content_by_id() -- single source of truth
     │   ├── bm25_retriever.py
     │   ├── vector_retriever.py
     │   ├── fusion.py
     │   ├── reranker.py
     │   ├── exact_match.py       # ExactMatchBooster: pin known-item ID matches to rank 1
     │   └── hybrid.py
-    └── agent/
-        ├── router.py            # IntentRouter: classify(query) -> intent/category/confidence
-        ├── tools.py              # Tool schemas (pydantic) + ToolRegistry + handlers
-        └── orchestrator.py       # glue: router -> tool call (read) or report-only (write)
+    ├── agent/
+    │   ├── router.py            # IntentRouter: classify(query) -> intent/category/confidence
+    │   ├── tools.py              # Tool schemas (pydantic) + ToolRegistry + handlers
+    │   └── orchestrator.py       # glue: router -> tool call (read) or report-only (write)
+    └── generation/
+        ├── prompts.py            # citation-grounded generation system prompt
+        ├── generator.py          # LLM call -> structured claims + citations
+        ├── groundedness.py       # NLI judge: is each claim entailed by its cited doc?
+        └── pipeline.py           # generate -> verify -> regen-or-reject
 ```
 
 The split is deliberate: `scripts/` produces artifacts in `data/` and then exits; `app/` loads those artifacts once and answers many queries against them. See [DECISIONS.md](DECISIONS.md).
@@ -207,12 +213,29 @@ python -m app.agent.orchestrator
 
 **Deliberately not built here:** entity/slot extraction (turning "block that IP" into a validated `ip_address`). The router's job is classifying *what* the user wants; extracting the *arguments* a write action needs is treated as a separate, harder problem left to PLAN's Action Planner (Phase 7) — building it now would be building for a pipeline stage (RBAC/confirm/execute) that doesn't exist to receive its output.
 
+### Online: generation + groundedness (`app/generation/`)
+
+Turns a read tool's ranked results into an actual cited answer (PLAN §14/§15), then verifies it before returning it (PLAN §16) — the last two boxes in PLAN §3's Read pipeline.
+
+1. **`Generator`** (`generator.py`) calls an LLM (see "LLM provider" below) with the query and the full text of the retrieved evidence documents, using structured output (`response_format: json_object` + Pydantic validation) to get back a `GeneratedAnswer`: a list of `Claim`s, each `{text, cited_document_ids}`, plus an `insufficient_evidence` flag — not free-text the caller has to parse. This structure is what makes the next step possible without a fragile sentence-splitting pass.
+2. **`GroundednessJudge`** (`groundedness.py`) checks each claim individually against *only the document(s) it cites* using an NLI cross-encoder (`MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, loaded once via `sentence-transformers.CrossEncoder` — same pattern as the reranker) — premise = cited document's content, hypothesis = the claim text, checked for entailment probability above a threshold. Catches three distinct failure modes: hallucination (no support anywhere), misattribution (a real, relevant citation that doesn't actually say the specific thing claimed), and a fabricated `document_id` (empty evidence text, always fails). An answer is `grounded` only if **every** claim passes — see [DECISIONS.md](DECISIONS.md) for why this specific NLI checkpoint, not the first one tried.
+3. **`GenerationPipeline`** (`pipeline.py`) ties them together with the regen-or-reject path: generate → verify → if ungrounded, retry once naming exactly which claims failed → if still ungrounded, return only the claims that verified, with an explicit "insufficient evidence" note. A `GeneratedAnswer` with zero claims (the model correctly declining) short-circuits as an immediate success — there's nothing to retry.
+
+**LLM provider:** not the Anthropic API — the user supplied their own OpenAI-compatible endpoint and model (`deepseek/deepseek-v4-flash` via a third-party proxy), configured through a local `.env` (`LLM_API_KEY`, `LLM_ENDPOINT`, loaded with `python-dotenv`; `.env` is gitignored). `generator.py` uses the `openai` Python SDK pointed at that `base_url`. See [DECISIONS.md](DECISIONS.md) for a real gotcha found while wiring this up: the endpoint serves a reasoning model whose hidden reasoning tokens are billed against the same `max_tokens` as the visible answer, so a tight token budget silently truncates output.
+
+Run it directly:
+```
+python -m app.generation.generator
+python -m app.generation.groundedness
+python -m app.generation.pipeline
+```
+
 ## Not yet built
 
 These are the natural next layers, not yet implemented:
 
 - **API layer** (`fastapi`/`uvicorn`/`pydantic` are already in `requirements.txt`): a thin HTTP wrapper around `Orchestrator`, likely `app/main.py` + `app/api/chat.py`, holding one instance at process startup.
-- **Answer synthesis**: an LLM step that takes a read tool's results and generates a cited answer (technique/rule IDs as citations), rather than returning a raw ranked list. Right now `Orchestrator` returns retrieval results directly.
+- **`Orchestrator` doesn't call `GenerationPipeline` yet**: Phase 5's `Orchestrator` still returns raw tool results for read intents; wiring in `app/generation/` so a read query gets a cited answer instead of a ranked list is the natural next step, not yet done.
 - **`pysigma`** (already in `requirements.txt`, unused so far): intended for translating Sigma detection logic into query-backend-specific queries (e.g. for a "does this rule apply to my SIEM" feature) — not wired into retrieval.
 - **Runbooks and synthetic alerts** (PLAN §4.3/§4.4): the schema is designed to accept them (see "Extending to new doc_types" above) but neither corpus exists yet; `lookup_ioc`/`get_alert`/`get_incident` stay stubs until they do.
 - **RBAC + propose-confirm-execute** (PLAN §17-19, Phase 7): `block_ip`/`isolate_endpoint`/`create_incident` are classified correctly by the router and declare their eventual `required_permission`, but nothing executes them — no authorization check, no confirmation step, no mock firewall/EDR/incident API to call.

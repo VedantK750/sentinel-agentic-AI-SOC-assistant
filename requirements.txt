@@ -7,3 +7,5 @@ numpy
 pydantic
 pyyaml
 pysigma
+openai
+python-dotenv

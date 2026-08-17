@@ -4,6 +4,47 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-17 — Consolidated document-loading into `app/retrieval/documents.py`
+
+**Decision:** `load_documents()` / `load_content_by_id()` now live in one file. `CrossEncoderReranker`, `ExactMatchBooster`, and `GroundednessJudge` all import from it instead of each having their own copy of "read `documents.json`, build an `id -> content` dict."
+
+**Why:** about to write a fourth independent copy of the same seven lines for the groundedness judge — and this project already has a concrete example of what duplicated "load and index the same data" logic costs: the BM25 tokenizer bug (see below) existed specifically because `tokenize()` was copy-pasted instead of shared, and index-time/query-time silently drifted apart. Same risk shape here (three-plus components independently parsing the same corpus file), so consolidated proactively rather than waiting for a second version of that bug.
+
+---
+
+## 2026-08-17 — Phase 6: generation uses a non-Anthropic LLM (user-provided endpoint), not the Claude API
+
+**Decision:** `app/generation/generator.py` calls `deepseek/deepseek-v4-flash` via a third-party OpenAI-compatible proxy (`https://aicredits.in/v1`), using the `openai` Python SDK pointed at a custom `base_url`, with credentials from a local `.env` file (`LLM_API_KEY`, `LLM_ENDPOINT`) loaded via `python-dotenv`.
+
+**Why not Anthropic:** the user has existing API credits/access for this specific provider and asked for it by name. Anthropic's SDK only talks to Anthropic's API — using it here would mean either ignoring the user's actual credentials or silently building something that can't run. The OpenAI-compatible `chat.completions` shape is what this proxy speaks, so that's the client used.
+
+**Immediate operational finding:** `.env` was present in the repo but **not gitignored** — caught and fixed (added to `.gitignore`) before any commit, since the API key would otherwise have been pushed to git history on the next `git add -A`. Worth calling out explicitly: this is exactly the kind of thing the "review what's staged before committing" habit exists to catch, and it did.
+
+**A real gotcha found via testing, not assumed:** this endpoint serves a reasoning model that emits hidden `reasoning_content` tokens (its chain-of-thought) billed against the *same* `max_tokens` budget as the visible `content` — there's no separate thinking-budget parameter the way Anthropic's `thinking` config provides. A first test at `max_tokens=100` silently truncated a two-line JSON reply (`finish_reason: "length"`, `content: '{"status'`) because ~97 of the 100 tokens went to invisible reasoning. Fixed by using `max_tokens=2048` for generation calls and reading only `.content`, never `.reasoning_content`. Documented in `generator.py` itself since this is exactly the kind of provider-specific constraint that bites the next person editing the file without reading history first.
+
+**Structured output, verified working:** `response_format={"type": "json_object"}` reliably produces valid JSON matching the `GeneratedAnswer` Pydantic schema (a list of `{text, cited_document_ids}` claims + an `insufficient_evidence` flag) — confirmed by direct testing with a real query and real retrieved evidence, correctly attributing each claim to the right document, before writing any of the surrounding pipeline code.
+
+---
+
+## 2026-08-17 — Groundedness judge: NLI model swapped after real evidence it didn't work
+
+**Decision:** `app/generation/groundedness.py`'s `GroundednessJudge` uses `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli`, not the originally-planned `cross-encoder/nli-deberta-v3-base`.
+
+**What happened:** built the judge exactly as scoped earlier (NLI cross-encoder, premise = cited document content, hypothesis = claim text, entailment probability vs. a threshold) with `cross-encoder/nli-deberta-v3-base` — the first NLI checkpoint that came to mind, same `sentence-transformers` CrossEncoder pattern already validated for reranking. Tested it against a claim that was a **near-verbatim restatement of the actual document text** — about as clear an entailment case as exists. It scored entailment probability **0.003**, classifying the pair as "neutral." Not a marginal miss — a claim that should obviously pass was rejected by a wide margin.
+
+**Root cause, diagnosed rather than papered over:** that checkpoint is trained on SNLI/MultiNLI — short, generic, single-sentence premise/hypothesis pairs (image captions, everyday sentences). Fed a full technical paragraph as the premise (our actual use case: document content vs. a claim), it's out-of-distribution and doesn't reliably recognize entailment even for near-identical phrasing in specialized (cybersecurity) text. Verified this wasn't a bug in my usage first — checked `model.config.id2label` for the correct index, tried both argument orders, and confirmed the model scores a classic textbook SNLI pair correctly (0.975 entailment) — so the model works as documented, it just doesn't transfer to this task.
+
+**Fix:** switched to `MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli` — trained on MNLI **plus FEVER** (a claim-vs-evidence-passage fact-verification dataset) **plus ANLI** (adversarially-constructed hard examples). FEVER's task shape — "does this evidence passage support this claim" — is a direct match for RAG groundedness checking, unlike generic short-sentence NLI. Re-tested the same near-verbatim claim: **entailment probability 0.983**. Also correctly separated a misattribution case (a true statement, but citing the wrong document — the parent technique instead of the subtechnique that actually says it) as contradiction (0.839), and a fabricated-citation case as unsupported (empty evidence text, never reaches the model). This checkpoint's label order is **different** from the first one (`{0: entailment, 1: neutral, 2: contradiction}` vs. the first model's `{0: contradiction, 1: entailment, 2: neutral}`) — re-verified empirically rather than assumed, since copy-pasting the index from the first model would have silently inverted every verdict on the second.
+
+**Why this matters beyond "picked a better model":** this is the same *type* of lesson as the BM25 stopword bug — a component that looked correct in isolation (documented API, right index, right label names) failed on the actual data shape this project needed, and the fix was found by testing against a real example with a known-correct answer, not by reading further documentation. The general takeaway carried forward: verify a model or library against a *concrete example with a known-correct answer specific to your domain*, not just its own documented behavior on its own benchmark.
+
+**End-to-end validation of the full pipeline** (`app/generation/pipeline.py`, which ties generation + judge + regen-or-reject together): three test queries exercised all three of PLAN §16's required behaviors in one run —
+- `"How do I detect mimikatz?"` — first attempt had an ungrounded claim, retried with the failure named explicitly, second attempt fully grounded (the regen path).
+- `"What is T1059?"` — after retry, some claims verified and some didn't; the ones that didn't were dropped, not silently kept (the partial-fallback path).
+- `"What is the airspeed of a swallow?"` — zero relevant evidence exists for this query; the model correctly returned `insufficient_evidence: true` with no claims at all on the *first* attempt, rather than fabricating something — no retry needed because there was nothing wrong to retry.
+
+---
+
 ## 2026-08-16 — Exact-match boosting for known-item queries (`app/retrieval/exact_match.py`)
 
 **Decision:** Added `ExactMatchBooster` as an explicit final stage after RRF+rerank: it detects known-item identifiers in the query (ATT&CK technique IDs, Sigma rule UUIDs — a registry of `(regex pattern, metadata field)` pairs, extensible to IOCs later) and, if the corpus has a document with that exact ID, pins it to the front of the result list. Deliberately a separate stage, not folded into `HybridSearcher` or the reranker — the same reasoning as keeping reranking separate from RRF: BM25/vector/RRF/RRF+rerank keep meaning exactly what the Phase 4 eval already measured, and this stage's own effect is independently measurable (`scripts/evaluate_retrieval.py` now has a fifth `rrf+rerank+boost` column).

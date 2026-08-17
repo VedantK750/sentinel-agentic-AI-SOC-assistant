@@ -1,18 +1,14 @@
-import json
-from pathlib import Path
-
 from sentence_transformers import CrossEncoder
 
-ROOT = Path(__file__).resolve().parents[2]
-DOCS_PATH = ROOT / "data" / "documents.json"
+from .documents import DOCS_PATH, load_content_by_id
+
 MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
 class CrossEncoderReranker:
     def __init__(self, model_name=MODEL_NAME, docs_path=DOCS_PATH):
         self.model = CrossEncoder(model_name)
-        documents = json.loads(Path(docs_path).read_text(encoding="utf-8"))
-        self.content_by_id = {doc["document_id"]: doc.get("content", "") for doc in documents}
+        self.content_by_id = load_content_by_id(docs_path)
 
     def rerank(self, query, candidates, limit=10):
         """Re-score `candidates` (ranked dicts with a "document_id"/"title" key, e.g.

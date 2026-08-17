@@ -1,9 +1,6 @@
-import json
 import re
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-DOCS_PATH = ROOT / "data" / "documents.json"
+from .documents import DOCS_PATH, load_documents
 
 # A registry of known-item identifier patterns, not hardcoded logic per ID type --
 # extensible to IOC-style identifiers (IPs, hashes) once that data exists (PLAN
@@ -47,7 +44,7 @@ class ExactMatchBooster:
 
     def __init__(self, docs_path=DOCS_PATH, patterns=None):
         self.patterns = patterns if patterns is not None else ID_PATTERNS
-        documents = json.loads(Path(docs_path).read_text(encoding="utf-8"))
+        documents = load_documents(docs_path)
         # {metadata_field: {normalized_id_value: document}}
         self._index = {}
         for spec in self.patterns:
