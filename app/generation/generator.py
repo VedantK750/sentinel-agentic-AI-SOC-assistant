@@ -12,19 +12,16 @@ from .prompts import SYSTEM_PROMPT, build_user_prompt
 ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(dotenv_path=ROOT / ".env")
 
-DEFAULT_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash")
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct")
 
-# The endpoint is a reasoning model that writes hidden "reasoning_content" tokens
-# before the visible answer, billed against the same completion budget -- a request
-# capped at a few hundred tokens can exhaust itself on reasoning and return truncated
-# JSON (finish_reason="length") with empty/partial `content`. How much reasoning it
-# does is query-dependent, not a fixed overhead: a harder or more sensitive-sounding
-# query (verified case: "How to do WIFI hacking on windows?", which visibly made the
-# model deliberate at length about how to frame the answer) can exhaust even a budget
-# that was previously plenty for simpler queries. A fixed constant is therefore not
-# actually robust -- retrying with an expanding budget on truncation is, since it
-# reacts to what this specific request needed instead of guessing a ceiling upfront.
-# See DECISIONS.md.
+# Deliberately a non-thinking model (see DECISIONS.md) -- no hidden reasoning tokens
+# competing with the visible answer for the completion budget, unlike the reasoning
+# model this project used earlier. The retry-on-truncation logic below is kept anyway:
+# it's a general defensive measure (any model can produce a long, multi-claim answer
+# that gets cut off if max_tokens is too tight for that specific request -- more
+# evidence documents naturally means more claims), not specific to reasoning-token
+# overhead. Retrying with an expanding budget reacts to what a given request actually
+# needed instead of guessing a fixed ceiling upfront.
 INITIAL_MAX_TOKENS = 2048
 MAX_TOKENS_RETRIES = 2  # 2048 -> 4096 -> 8192
 
@@ -52,8 +49,8 @@ class Generator:
     retrieved documents, produce a list of atomic claims, each citing the document(s)
     it's based on. Structured output (not free-text parsing) is the point -- it's what
     makes per-claim groundedness checking possible without a fragile sentence-splitting
-    step. See DECISIONS.md for why this endpoint specifically needs a generous
-    max_tokens and why response_format is used instead of a stricter schema mode.
+    step. See DECISIONS.md for the model swap from a reasoning model to this one and
+    why response_format is used instead of a stricter schema mode.
     """
 
     def __init__(self, model=DEFAULT_MODEL, timeout=REQUEST_TIMEOUT):

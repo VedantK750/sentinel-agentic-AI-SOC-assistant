@@ -4,6 +4,20 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-18 — Switched generation model to a genuinely non-thinking model
+
+**Decision:** `LLM_MODEL` is now `meta-llama/llama-3.1-8b-instruct`, not `deepseek/deepseek-v4-flash`. Set via `.env` (not committed) with the same default mirrored in `generator.py`'s fallback.
+
+**Why:** every LLM-related bug in this project so far (truncated JSON at a "safe" `max_tokens`, a 3.5-minute hang before an eventual 500) traced back to the same root cause — a reasoning model spending an unpredictable, query-dependent number of hidden tokens before ever producing the visible answer. Retrying with an expanding token budget and adding a timeout treated the symptom; switching to a model with no hidden reasoning step removes the underlying cause for this specific failure class entirely.
+
+**The exact model name requested didn't work — found via testing, not assumed correct:** `meta-llama/llama-3-8b-instruct` returned `404 - No endpoints found`. Checked `client.models.list()` rather than guessing at name variants: it's actually listed in the endpoint's 440-model catalog, but has no live serving backend right now — a real state an OpenRouter-style aggregator can be in (catalogued, not currently routable), not a typo. `meta-llama/llama-3.1-8b-instruct` — same model family, one point release later — is live. Confirmed it's genuinely non-thinking before adopting it: `message.reasoning_content` is `None` and `usage.completion_tokens_details.reasoning_tokens` is untracked, unlike the deepseek responses which always populated both.
+
+**Kept, not removed, despite the model change:** the retry-on-truncation logic (expanding `max_tokens` on `finish_reason == "length"`), the 90s client timeout, and the `OpenAIError` handling added last turn. These are general defensive measures — any model can produce a long multi-claim answer that gets cut off if the budget is too tight for that specific request, and a slow/failing call is possible regardless of which model is behind the endpoint. Only the code comments explaining *why* were updated, since they'd been written specifically around reasoning-token overhead that no longer applies to the default model (though `LLM_MODEL` remains swappable, so the defensive logic staying in place is deliberate, not leftover).
+
+**Verified end to end**, not just at the API level: ran the full pipeline (`app/cli.py`) against `"What is T1059?"` with the new model — completed without truncation, without hitting the timeout, and without any reasoning-token overhead, producing 7 well-grounded claims (one attempt's claim was correctly dropped by the groundedness judge, consistent with prior behavior, confirming the judge and regen-or-reject path work the same regardless of which model sits behind `Generator`).
+
+---
+
 ## 2026-08-18 — LLM call had no timeout, no error handling, and no progress visibility
 
 **What happened:** the user asked, mid-run, why a query was taking minutes. Investigated the live process rather than guessing: `ps` showed it still at 70%+ CPU after 3.5 minutes (actively working, not hung), with two open HTTPS connections — one to Hugging Face's CDN, one to a Cloudflare-fronted host (the LLM endpoint, no reverse DNS). It eventually crashed the whole CLI with an unhandled `openai.InternalServerError` traceback.
