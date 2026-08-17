@@ -79,6 +79,9 @@ INTENTS = [
             "How does lateral movement work",
             "Explain reverse shells",
             "What is a supply chain attack",
+            "How do attackers hack into wifi networks",
+            "How is Windows hacked",
+            "How do hackers break into a system",
         ],
     ),
     Intent(

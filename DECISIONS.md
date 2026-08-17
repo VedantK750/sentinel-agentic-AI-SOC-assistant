@@ -4,6 +4,22 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-18 — Two bugs found and fixed through the user's own manual testing
+
+Both surfaced from a single real query the user tried: `"How to do WIFI hacking on windows?"`. Neither was something the existing eval set or demo queries would have caught — a concrete argument for why manual exploration matters even after automated checks pass.
+
+**Bug 1 — the router had no vocabulary for colloquial "hacking" phrasing.** All 5 intents' example utterances used formal security terminology ("ransomware", "phishing", "reverse shell", "supply chain attack"); none used the word "hacking". Measured, not guessed: pulled the full per-intent score breakdown for this query and found `block_ip` (0.322) and `isolate_endpoint` (0.320) narrowly outscored every read intent (best read: `explain_technique` at 0.206) — "hacking" sits semantically closer to the write intents' threat-response framing than to any read intent's descriptive framing. The router correctly refused to commit (0.322 is nowhere near the 0.55 write threshold, margin 0.002 is nowhere near the 0.05 requirement) — but as a side effect it also blocked a read query the corpus could actually answer (confirmed: `T1669` "Wi-Fi Networks", `T1016.002` "Wi-Fi Discovery", and a Sigma Wi-Fi-credential-harvesting rule all exist and retrieval finds them directly).
+
+Before touching code, checked whether a *threshold-logic* fix would even help: computed each read intent's semantic score in isolation, ignoring the write intents entirely. All three still fell below the 0.35 read threshold (best: 0.206) — meaning a rule like "prefer read when write intents are weak" would have been a no-op for this exact case. The actual gap was vocabulary coverage, not threshold logic. Verified the real fix before writing it: tested candidate example phrasings against the failing query and found `"How do attackers hack into wifi networks"` scored 0.719 — comfortably clearing both thresholds. Added that phrasing plus two similar ones (`"How is Windows hacked"`, `"How do hackers break into a system"`) to `search_knowledge_base`'s examples in `app/agent/router.py`. Re-ran every previously-validated router test case afterward (all the Phase 5 edge cases, including `"block"` alone still correctly declining) — no regressions.
+
+**Bug 2 — the reasoning-model `max_tokens` fix from Phase 6 wasn't actually robust.** Once routing was fixed, generation on this query hit the *exact same* truncation failure documented earlier (`finish_reason: "length"`, empty `content`) — at `max_tokens=2048`, the value already raised specifically to fix this failure mode. Root cause: how much the model reasons before answering is **query-dependent**, not a fixed overhead per request. Inspected the model's own `reasoning_content` for this query and it was visibly deliberating at length about how to frame an answer to "hacking"-flavored phrasing before ever reaching the JSON output — more reasoning than the simpler queries the 2048 figure was tuned against consumed. A fixed constant, however generous, is a guess about the ceiling; the actual fix is reacting to the failure rather than guessing bigger.
+
+**Fix:** `Generator.generate()` now detects `finish_reason == "length"` and retries the same request with a doubled `max_tokens` (2048 → 4096 → 8192, capped at 2 retries), instead of returning `None` on the first truncation. Verified: the WiFi query, which previously failed to parse at all, now returns 7 well-cited, fully grounded claims (`grounded: True`, `attempts: 1` through the judge — the generator's internal token-budget retry is invisible to the groundedness pipeline, which only ever sees a complete response).
+
+**The general lesson, stated plainly:** a fix verified against 2-3 test cases is a hypothesis, not a guarantee — this is the second time in this project a "verified" fix (BM25 stopwords, now this) turned out to have a harder case waiting. Where possible, prefer a fix that reacts to the actual failure condition at runtime (detect truncation, retry) over one that hard-codes a guess about how bad things can get (a bigger constant).
+
+---
+
 ## 2026-08-17 — Consolidated document-loading into `app/retrieval/documents.py`
 
 **Decision:** `load_documents()` / `load_content_by_id()` now live in one file. `CrossEncoderReranker`, `ExactMatchBooster`, and `GroundednessJudge` all import from it instead of each having their own copy of "read `documents.json`, build an `id -> content` dict."

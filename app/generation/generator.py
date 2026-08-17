@@ -17,10 +17,16 @@ DEFAULT_MODEL = os.environ.get("LLM_MODEL", "deepseek/deepseek-v4-flash")
 # The endpoint is a reasoning model that writes hidden "reasoning_content" tokens
 # before the visible answer, billed against the same completion budget -- a request
 # capped at a few hundred tokens can exhaust itself on reasoning and return truncated
-# JSON (finish_reason="length") with empty/partial `content`. Verified empirically:
-# max_tokens=100 truncated a two-line JSON reply after ~97 reasoning tokens; 1000+
-# leaves enough room. See DECISIONS.md.
-MAX_TOKENS = 2048
+# JSON (finish_reason="length") with empty/partial `content`. How much reasoning it
+# does is query-dependent, not a fixed overhead: a harder or more sensitive-sounding
+# query (verified case: "How to do WIFI hacking on windows?", which visibly made the
+# model deliberate at length about how to frame the answer) can exhaust even a budget
+# that was previously plenty for simpler queries. A fixed constant is therefore not
+# actually robust -- retrying with an expanding budget on truncation is, since it
+# reacts to what this specific request needed instead of guessing a ceiling upfront.
+# See DECISIONS.md.
+INITIAL_MAX_TOKENS = 2048
+MAX_TOKENS_RETRIES = 2  # 2048 -> 4096 -> 8192
 
 
 class Claim(BaseModel):
@@ -50,25 +56,33 @@ class Generator:
         self.model = model
 
     def generate(self, query, documents, failed_claims=None) -> Optional[GeneratedAnswer]:
-        """Returns None if the model's response isn't valid JSON matching the schema --
-        callers should treat that the same as "insufficient evidence", not crash.
+        """Returns None if the model's response isn't valid JSON matching the schema
+        even after expanding the token budget -- callers should treat that the same
+        as "insufficient evidence", not crash.
         """
         user_prompt = build_user_prompt(query, documents, failed_claims=failed_claims)
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=MAX_TOKENS,
-        )
-        content = response.choices[0].message.content
-        try:
-            data = json.loads(content)
-            return GeneratedAnswer(**data)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        max_tokens = INITIAL_MAX_TOKENS
+        for attempt in range(MAX_TOKENS_RETRIES + 1):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens,
+            )
+            choice = response.choices[0]
+            if choice.finish_reason == "length" and attempt < MAX_TOKENS_RETRIES:
+                max_tokens *= 2
+                continue
+            try:
+                return GeneratedAnswer(**json.loads(choice.message.content))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+        return None
 
 
 def main():
