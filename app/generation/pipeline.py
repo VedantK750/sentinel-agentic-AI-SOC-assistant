@@ -11,6 +11,16 @@ class GenerationPipeline:
     verify, with an explicit "insufficient evidence" note -- never silently return an
     answer that failed the check. See the groundedness-judge design discussion in
     DECISIONS.md for why this is one retry, not a loop.
+
+    Verified claims are accumulated across attempts, not replaced each retry. Found
+    the hard way: each retry is a full regeneration, not a patch of the specific
+    failed claim, and the model can rephrase a claim that passed fine into wording
+    that fails the judge (or vice versa) even though the underlying fact is
+    unchanged -- observed directly on a real query, where a `doas` tool claim scored
+    0.851 (pass) in one attempt and 0.125 (fail) in the next, just from being
+    reworded shorter. Keeping only the *last* attempt's survivors meant a handful of
+    already-verified, still-true claims from an earlier attempt got silently thrown
+    away for no reason connected to their truth. See DECISIONS.md.
     """
 
     def __init__(self, generator=None, judge=None):
@@ -19,7 +29,14 @@ class GenerationPipeline:
 
     def answer(self, query, documents):
         failed_claims = None
-        verdict = None
+        accumulated = []
+        seen_texts = set()
+
+        def merge_supported(claim_results):
+            for r in claim_results:
+                if r["supported"] and r["claim"].text not in seen_texts:
+                    accumulated.append(r["claim"].model_dump())
+                    seen_texts.add(r["claim"].text)
 
         for attempt in range(1, MAX_RETRIES + 2):
             print(f"[pipeline] generation attempt {attempt}/{MAX_RETRIES + 1}...")
@@ -28,8 +45,12 @@ class GenerationPipeline:
                 continue  # unparseable response -- retry blind, nothing to point at
 
             if not generated.claims:
-                # Model correctly declined (insufficient evidence) -- nothing to verify,
-                # nothing to retry. This is success, not failure.
+                # Model declined this attempt. If earlier attempts already verified
+                # some claims, that's a real answer -- a later regeneration giving up
+                # shouldn't erase it. Otherwise this is a clean, correct "insufficient
+                # evidence" from the very first attempt.
+                if accumulated:
+                    break
                 return {
                     "claims": [],
                     "grounded": True,
@@ -39,9 +60,11 @@ class GenerationPipeline:
 
             print(f"[pipeline] verifying {len(generated.claims)} claim(s) against evidence...")
             verdict = self.judge.verify(generated)
+            merge_supported(verdict["claim_results"])
+
             if verdict["grounded"]:
                 return {
-                    "claims": [c.model_dump() for c in generated.claims],
+                    "claims": accumulated,
                     "grounded": True,
                     "insufficient_evidence": generated.insufficient_evidence,
                     "attempts": attempt,
@@ -53,19 +76,20 @@ class GenerationPipeline:
                 if not r["supported"]
             ]
 
-        supported_claims = (
-            [r["claim"].model_dump() for r in verdict["claim_results"] if r["supported"]]
-            if verdict
-            else []
-        )
+        # `grounded` reflects whether `claims` is trustworthy, not whether every
+        # attempt went cleanly -- every entry in `accumulated` individually passed
+        # the judge, whichever attempt it came from, so this is grounded whenever
+        # there's anything to show at all.
         return {
-            "claims": supported_claims,
-            "grounded": False,
-            "insufficient_evidence": True,
+            "claims": accumulated,
+            "grounded": bool(accumulated),
+            "insufficient_evidence": not accumulated,
             "attempts": MAX_RETRIES + 1,
             "message": (
-                "Some claims could not be verified against the evidence and were dropped."
-                if supported_claims
+                "Answer assembled from claims verified across multiple generation "
+                "attempts; some individual claims along the way were unsupported "
+                "and dropped."
+                if accumulated
                 else "Could not produce a grounded answer from the retrieved evidence."
             ),
         }

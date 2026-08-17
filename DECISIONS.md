@@ -4,6 +4,20 @@ A running log of non-obvious technical decisions: what was chosen, why, and what
 
 ---
 
+## 2026-08-18 — GenerationPipeline was silently discarding already-verified claims on retry
+
+**What happened:** the user asked why a real run went from "verifying 7 claim(s)" on attempt 1 down to "verifying 3 claim(s)" on attempt 2, and asked for a rating of the delivered answer. Reproduced the exact scenario with per-claim entailment scores visible (not just pass/fail) rather than guessing.
+
+**The mechanism, confirmed precisely:** a retry is a **full regeneration**, not a patch of the specific failed claim. `Generator.generate()` is called again with the failed claims named in the prompt as feedback, but the model is free to (and does) rewrite the entire answer — different wording, sometimes a different number of claims entirely. This directly answered the user's question: attempt 2 is not "attempt 1 minus the bad one," it's a fresh draft that happens to overlap heavily but imperfectly with attempt 1.
+
+**A striking concrete instance of judge fragility, found in the reproduction:** a claim about the `doas` tool scored **entailment p=0.851 (pass)** in attempt 1, phrased as a near-verbatim lift of the source (*"...allows standard users to perform tasks as root, the same way 'sudo' does"*). The same underlying fact, reworded shorter in attempt 2 (*"...to perform tasks as root, similar to 'sudo'"*), scored **p=0.125 (fail)**. Same source, same fact, both reasonable phrasings — a 0.7 swing in the judge's confidence from wording alone. Confirms (with a concrete example, not just a general concern) that the NLI judge's score is not a calibrated "is this true" signal — it's sensitive to phrasing, a known limitation of the approach documented when the NLI checkpoint was first chosen, now demonstrated directly.
+
+**The actual bug this exposed:** `GenerationPipeline.answer()` only ever returned the *last* attempt's supported claims. When attempt 1 had 5 solidly-grounded claims (chroot, `doas`, `sudoers.d` persistence, general sudo caching, tty_tickets — entailment scores 0.826–0.981) but wasn't *fully* grounded (one other claim failed), and attempt 2 regenerated a smaller, differently-worded set, the final answer discarded everything from attempt 1 that didn't happen to reappear in attempt 2 — even though it had already been independently verified true. Delivered to the user: 2 narrow claims, when 5+ well-grounded ones existed. Rated 4/10 as delivered: correct, but badly incomplete for reasons unrelated to evidence quality or grounding — a process bug, not a retrieval or generation failure.
+
+**Fix:** `GenerationPipeline` now accumulates every claim that ever passes the judge, deduplicated by text, across all attempts — not just the final attempt's survivors. A later attempt regenerating differently no longer erases earlier verified content. `grounded` and `insufficient_evidence` now reflect "is there real, verified content to show" (true whenever `accumulated` is non-empty) rather than "did one single attempt go 100% cleanly." Verified: re-ran the same query end to end after the fix — **9 claims** in the final answer (up from 2), spanning every technique the evidence actually supports, all individually verified.
+
+---
+
 ## 2026-08-18 — Switched generation model to a genuinely non-thinking model
 
 **Decision:** `LLM_MODEL` is now `meta-llama/llama-3.1-8b-instruct`, not `deepseek/deepseek-v4-flash`. Set via `.env` (not committed) with the same default mirrored in `generator.py`'s fallback.
