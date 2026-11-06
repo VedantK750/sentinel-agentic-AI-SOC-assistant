@@ -7,8 +7,10 @@ Usage:
     python -m app.cli "What is T1059?"
 """
 import sys
+import textwrap
 
 from app.agent.orchestrator import Orchestrator
+from app.generation.render import render_answer
 
 
 def main():
@@ -47,9 +49,14 @@ def main():
     print("\nanswer:")
     if not result["claims"]:
         print("  (no claims -- insufficient evidence to answer)")
-    for claim in result["claims"]:
-        print(f"  - {claim['text']}")
-        print(f"    cites: {claim['cited_document_ids']}")
+    else:
+        rendered = render_answer(result["claims"], result.get("retrieved", []))
+        print(textwrap.fill(rendered["text"], width=100, initial_indent="  ", subsequent_indent="  "))
+
+        print("\nsources:")
+        for ref in rendered["references"]:
+            url_part = f" -- {ref['url']}" if ref["url"] else ""
+            print(f"  [{ref['marker']}] {ref['title']} ({ref['source']}){url_part}")
 
 
 if __name__ == "__main__":

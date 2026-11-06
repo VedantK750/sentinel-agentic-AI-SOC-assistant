@@ -25,9 +25,12 @@ ENTAILMENT_INDEX = 0
 ENTAILMENT_THRESHOLD = 0.5
 
 
-def _softmax(logits):
-    exp = np.exp(logits - np.max(logits))
-    return exp / exp.sum()
+def _softmax_rows(logits):
+    """Row-wise softmax over a (N, num_labels) array -- N examples scored in one
+    batch, each normalized independently."""
+    logits = np.atleast_2d(logits)
+    exp = np.exp(logits - np.max(logits, axis=1, keepdims=True))
+    return exp / exp.sum(axis=1, keepdims=True)
 
 
 class GroundednessJudge:
@@ -44,26 +47,58 @@ class GroundednessJudge:
         self.model = CrossEncoder(model_name)
         self.content_by_id = load_content_by_id(docs_path)
 
-    def _entailment_prob(self, premise, hypothesis):
-        logits = self.model.predict([(premise, hypothesis)])[0]
-        return float(_softmax(logits)[ENTAILMENT_INDEX])
+    def _evidence_text(self, cited_document_ids):
+        return " ".join(self.content_by_id.get(doc_id, "") for doc_id in cited_document_ids).strip()
+
+    def _entailment_probs(self, pairs):
+        """pairs: list of (premise, hypothesis). One batched model.predict() call
+        for the whole list, not one call per pair -- see verify() for why this
+        matters."""
+        if not pairs:
+            return []
+        logits = self.model.predict(pairs)
+        return _softmax_rows(logits)[:, ENTAILMENT_INDEX].tolist()
 
     def verify_claim(self, claim):
-        evidence_text = " ".join(
-            self.content_by_id.get(doc_id, "") for doc_id in claim.cited_document_ids
-        ).strip()
+        """Verifies a single claim in isolation (one model call). verify() does NOT
+        use this in a loop for multi-claim answers -- it batches instead; this is
+        for standalone single-claim use."""
+        evidence_text = self._evidence_text(claim.cited_document_ids)
         if not evidence_text:
             return {"claim": claim, "supported": False, "entailment_prob": 0.0, "reason": "cited document not found"}
-        prob = self._entailment_prob(evidence_text, claim.text)
+        prob = self._entailment_probs([(evidence_text, claim.text)])[0]
         return {"claim": claim, "supported": prob >= ENTAILMENT_THRESHOLD, "entailment_prob": prob}
 
     def verify(self, answer):
         """Returns {"grounded": bool, "claim_results": [...]}. An answer with zero
         claims is not grounded -- there's nothing to have verified.
+
+        All claims with real cited evidence are scored in a SINGLE batched
+        model.predict() call, not one call per claim. Found via latency profiling
+        (scripts/measure_latency.py) that the per-claim loop was the dominant cost
+        in this stage -- a 5-claim verify pass took 58.85s (~11.8s/claim), far out
+        of line with this model's actual per-example inference cost. Claims citing
+        a document_id with no evidence text (fabricated citation) are unsupported
+        by construction and skip the model entirely, same as before. See DECISIONS.md.
         """
-        claim_results = [self.verify_claim(c) for c in answer.claims]
-        grounded = bool(claim_results) and all(r["supported"] for r in claim_results)
-        return {"grounded": grounded, "claim_results": claim_results}
+        claims = answer.claims
+        results = [None] * len(claims)
+        batch_indices, pairs = [], []
+
+        for i, claim in enumerate(claims):
+            evidence_text = self._evidence_text(claim.cited_document_ids)
+            if not evidence_text:
+                results[i] = {"claim": claim, "supported": False, "entailment_prob": 0.0, "reason": "cited document not found"}
+            else:
+                batch_indices.append(i)
+                pairs.append((evidence_text, claim.text))
+
+        for idx, prob in zip(batch_indices, self._entailment_probs(pairs)):
+            claim = claims[idx]
+            results[idx] = {"claim": claim, "supported": prob >= ENTAILMENT_THRESHOLD, "entailment_prob": prob}
+
+        grounded = bool(results) and all(r["supported"] for r in results)
+        return {"grounded": grounded, "claim_results": results}
 
 
 def main():
